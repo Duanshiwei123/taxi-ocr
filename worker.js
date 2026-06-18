@@ -156,6 +156,19 @@ function normalizeDateStr(val) {
   return s;
 }
 
+// Clean up origin/destination: strip trailing date+time that Baidu OCR sometimes appends
+function cleanAddressField(val) {
+  if (!val || typeof val !== 'string') return val || '';
+  let s = val.trim();
+  // Pattern 1: "地址2026-04-2322:39" (date+time stuck to end)
+  s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}\s*\d{1,2}:\d{2}$/, '');
+  // Pattern 2: "地址 2026-04-23 22:39" (date+time with space)
+  s = s.replace(/\s+\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}\s*$/, '');
+  // Pattern 3: just trailing date "地址2026-04-23"
+  s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}$/, '');
+  return s.trim();
+}
+
 // ─── 解析百度财务票据 OCR 结果 ────────────────────────────────────────────
 
 function parseMultipleInvoiceResult(data) {
@@ -187,8 +200,8 @@ function parseMultipleInvoiceResult(data) {
       extractedTime = getWordValue(result.Time) ||
         (getWordValue(result.PickupTime) + (getWordValue(result.DropoffTime) ? '-' + getWordValue(result.DropoffTime) : ''));
       extractedAmount = getWordValue(result.TotalFare) || getWordValue(result.Fare);
-      parsed.origin = getWordValue(result.PickupLocation) || getWordValue(result.Location);
-      parsed.destination = getWordValue(result.DropoffLocation) || '';
+      parsed.origin = cleanAddressField(getWordValue(result.PickupLocation) || getWordValue(result.Location));
+      parsed.destination = cleanAddressField(getWordValue(result.DropoffLocation) || '');
       parsed.invoice_no = getWordValue(result.InvoiceNum) || getWordValue(result.InvoiceCode);
 
     } else if (type === 'taxi_online_ticket') {
@@ -199,8 +212,8 @@ function parseMultipleInvoiceResult(data) {
         extractedDate = getWordValue(firstItem.pickup_date) || getWordValue(result.application_date);
         extractedTime = getWordValue(firstItem.pickup_time) || '';
         extractedAmount = getWordValue(firstItem.fare) || getWordValue(result.total_fare);
-        parsed.origin = getWordValue(firstItem.start_place) || '';
-        parsed.destination = getWordValue(firstItem.destination_place) || '';
+        parsed.origin = cleanAddressField(getWordValue(firstItem.start_place) || '');
+        parsed.destination = cleanAddressField(getWordValue(firstItem.destination_place) || '');
       }
       parsed.invoice_no = '';
 

@@ -757,6 +757,20 @@ function extractEmployeeNameFromText(text) {
 }
 
 // ── 从发票OCR原始文本中提取关键字段 ──
+
+// 清洗地址字段：去除末尾粘着的日期+时间（百度OCR常见问题）
+function cleanAddr(val) {
+  if (!val) return '';
+  let s = String(val).trim();
+  // "地址2026-04-2322:39" 日期时间紧贴
+  s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}\s*\d{1,2}:\d{2}$/, '');
+  // "地址 2026-04-23 22:39" 有空格
+  s = s.replace(/\s+\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}\s*$/, '');
+  // "地址2026-04-23" 纯日期
+  s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}$/, '');
+  return s.trim();
+}
+
 function extractInvoiceFields(rawText) {
   console.log('%c[前端-发票解析] ===== 从原始文本提取字段 =====', 'color:#1565c0;font-weight:bold');
   console.log('[前端-发票解析] 原始文本(前1000字):', (rawText || '').substring(0, 1000));
@@ -930,8 +944,8 @@ async function startAnalysis() {
           date:    fe.date || parsed.date || '',
           time:    fe.time || parsed.time || '',
           amount:  fe.amount || parsed.amount || '',
-          origin:  fe.origin || parsed.origin || '',
-          dest:    fe.dest || parsed.destination || parsed.dest || '',
+          origin:  cleanAddr(fe.origin || parsed.origin || ''),
+          dest:    cleanAddr(fe.dest || parsed.destination || parsed.dest || ''),
           type:    parsed.type || '网约车',
           invNo:   parsed.invoice_no || parsed.invNo || '',
           employee: currentEmployeeName,
