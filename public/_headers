@@ -1,0 +1,19 @@
+# 强制不缓存 HTML 文件（确保每次都能拿到最新版）
+/*.html
+  Cache-Control: no-cache, no-store, must-revalidate
+  Expires: 0
+
+# JS/CSS 带版本号缓存1小时
+/*.js
+  Cache-Control: max-age=3600
+
+/*.css
+  Cache-Control: max-age=3600
+
+# 图片缓存7天
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.ico
+  Cache-Control: max-age=604800

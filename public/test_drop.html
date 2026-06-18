@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8" />
+<style>
+body { font-family: sans-serif; padding: 20px; }
+.drop-zone { border: 3px dashed #ccc; padding: 40px; text-align: center; margin: 20px 0; background: #f9f9f9; }
+.drop-zone.dragover { border-color: #0055ff; background: #e8f0fe; }
+#log { background: #222; color: #0f0; padding: 10px; height: 200px; overflow: auto; font-family: monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h2>拖拽测试</h2>
+<div id="invZone" class="drop-zone">🧾 拖发票图片到这里</div>
+<div id="otZone" class="drop-zone">📋 拖加班记录到这里</div>
+<h3>控制台日志：</h3>
+<div id="log"></div>
+<script>
+const logEl = document.getElementById('log');
+function log(msg) {
+  console.log(msg);
+  logEl.textContent += msg + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setupDrop(id, multi) {
+  const el = document.getElementById(id);
+  if (!el) { log('ERROR: 找不到元素 ' + id); return; }
+  log('绑定拖拽: ' + id);
+  el.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.add('dragover');
+    log('dragover: ' + id);
+  });
+  el.addEventListener('dragleave', e => {
+    e.stopPropagation();
+    el.classList.remove('dragover');
+    log('dragleave: ' + id);
+  });
+  el.addEventListener('drop', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove('dragover');
+    log('DROP! ' + id + ' 收到 ' + e.dataTransfer.files.length + ' 个文件');
+    for (const f of e.dataTransfer.files) {
+      log('  - ' + f.name + ' (' + f.type + ', ' + f.size + ' bytes)');
+    }
+  });
+}
+window.addEventListener('DOMContentLoaded', () => {
+  log('DOMContentLoaded 触发');
+  setupDrop('invZone', true);
+  setupDrop('otZone', false);
+  log('初始化完成');
+});
+</script>
+</body>
+</html>
