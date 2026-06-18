@@ -7,7 +7,7 @@
   <!-- v20260617-1920 fix: new file to bypass CDN cache -->
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
-  <title>打车发票 & 加班记录核验系统 v20260618-1120</title>
+  <title>打车发票 & 加班记录核验系统 v20260618-1140</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -822,6 +822,7 @@ function extractInvoiceFields(rawText) {
     const addrCells = cells.filter(c => {
       if (/^\d+$/.test(c)) return false;
       if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}$/.test(c)) return false;
+      if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}$/.test(c)) return false;
       if (/^\d{1,2}:\d{2}$/.test(c)) return false;
       if (/(\d+\.?\d*)元?$/.test(c) && parseFloat(c) > 4) return false;
       if (/^(序号|服务商|车型|城市|及时|阳光|特惠|经济)$/.test(c)) return false;
