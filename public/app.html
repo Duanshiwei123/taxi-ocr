@@ -1,4 +1,4 @@
-﻿<!-- CACHE-BUST: 20260618-1610-fix-address-split -->
+﻿<!-- CACHE-BUST: 20260618-1625-fix-frontend-override -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -965,14 +965,78 @@ async function startAnalysis() {
         // 用前端提取逻辑从原始文本中提取字段
         const invText = raw.raw || raw.content || '';
         const fe = extractInvoiceFields(invText);
-        
+
+        // ── 智能合并 origin/dest：检测地址截断并自动修正 ──
+        // 场景：百度OCR把起点拆成"城市名"+"建筑名"两段，终点跑到distance字段
+        let finalOrigin = cleanAddr(fe.origin || parsed.origin || '');
+        let finalDest   = cleanAddr(fe.dest || parsed.destination || parsed.dest || '');
+
+        const originIsJustCity = /^[\u4e00-\u9fa5]{2,4}$/.test(finalOrigin) || /市$/.test(finalOrigin);
+        const destHasBuildingName = /(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|科技|商务)/.test(finalDest);
+
+        if (originIsJustCity && destHasBuildingName && finalOrigin && finalDest) {
+          console.log('[主流程] ⚠️ 检测到可能的地址截断: origin=' + finalOrigin + ' dest=' + finalDest);
+
+          // 尝试从raw文本中找distance字段藏着的真正终点
+          const distMatch = invText.match(/"distance"[^"]*"word"\s*:\s*"([^"]{2,30})"/i)
+                          || invText.match(/distance[^\w]*(\S{2,20}?)[\s,}]/gi);
+          let foundRealDest = '';
+          if (distMatch && distMatch[1]) {
+            const candidate = distMatch[1].replace(/[",]/g,'');
+            if (/(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|科技|商务|路|街|口|门|村|苑|阁|轩|居)/.test(candidate)) {
+              foundRealDest = candidate;
+            }
+          }
+
+          // 也尝试从parsed的原始JSON中找distance
+          if (!foundRealDest && raw.content) {
+            try {
+              const contentObj = JSON.parse(raw.content);
+              const rawDist = contentObj.distance || contentObj.rawDistance || '';
+              if (rawDist && /(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|科技|商务|路|街|口|门|村|苑|阁|轩|居)/.test(rawDist)) {
+                foundRealDest = String(rawDist).trim();
+              }
+            } catch(e) {}
+          }
+
+          // 策略A: 找到了藏在distance的真实终点
+          if (foundRealDest) {
+            console.log('[主流程] ✅ 发现真实终点("' + foundRealDest + '"),执行修正');
+            finalOrigin = cleanAddr(finalOrigin + finalDest);
+            finalDest = cleanAddr(foundRealDest);
+
+          } else {
+            // 策略B: 从raw文本终点行后续找额外地址行
+            const allLines = invText.split('\n');
+            let destLineIdx = -1;
+            for (let i = 0; i < allLines.length; i++) {
+              if (/终点/.test(allLines[i])) { destLineIdx = i; break; }
+            }
+            if (destLineIdx >= 0 && destLineIdx + 1 < allLines.length) {
+              const afterDest = allLines[destLineIdx + 1].trim();
+              const afterDestIsAddr = /^(?![\d])[\u4e00-\u9fa5]{2,}/.test(afterDest) &&
+                /(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|路|街|口|门|科技|商务|村|苑|阁|轩|居)/.test(afterDest) &&
+                !/(有限公司|金额|时间|日期|车型|服务商|序号|发票|元$|\d+\.?\d*)/.test(afterDest);
+              if (afterDestIsAddr) {
+                console.log('[主流程] ✅ 终点后续发现地址行("' + afterDest + '"),执行修正');
+                finalOrigin = cleanAddr(finalOrigin + finalDest);
+                finalDest = cleanAddr(afterDest);
+              } else {
+                console.log('[主流程] ⚠️ 地址截断检测到但无法修正');
+              }
+            } else {
+              console.log('[主流程] ⚠️ 地址截断检测到但无法修正');
+            }
+          }
+        }
+
         return {
           fileName: f.name,
           date:    fe.date || parsed.date || '',
           time:    fe.time || parsed.time || '',
           amount:  fe.amount || parsed.amount || '',
-          origin:  cleanAddr(fe.origin || parsed.origin || ''),
-          dest:    cleanAddr(fe.dest || parsed.destination || parsed.dest || ''),
+          origin:  finalOrigin,
+          dest:    finalDest,
           type:    parsed.type || '网约车',
           invNo:   parsed.invoice_no || parsed.invNo || '',
           employee: currentEmployeeName,
