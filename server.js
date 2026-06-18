@@ -49,8 +49,12 @@ async function callBaiduApi(token, apiPath, body) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body
   });
-  if (!resp.ok) throw new Error('Baidu OCR API error: HTTP ' + resp.status);
-  return await resp.json();
+  const result = await resp.json();
+  if (result.error_code) {
+    throw new Error('Baidu OCR error: ' + (result.error_msg || result.error_code));
+  }
+  if (!resp.ok) throw new Error('Baidu OCR API error: HTTP ' + resp.status + ' - ' + JSON.stringify(result));
+  return result;
 }
 
 // Helper: get word value from Baidu OCR result field (handles [{"word": "xxx"}] format)
@@ -217,6 +221,61 @@ function parseMultipleInvoiceResult(data) {
       }
       parsed.invoice_no = '';
 
+      // ── 后处理：检测并修复 taxi_online_ticket 地址字段错乱 ──
+      // 百度OCR有时会把长地址断行，导致：
+      //   start_place=城市名(截断), destination_place=起点的剩余部分, distance=真正终点
+      const fi = (items.length > 0) ? items[0] : null;
+      if (fi && parsed.origin && parsed.destination) {
+        const originIsJustCity = /^[\u4e00-\u9fa5]{2,4}$/.test(parsed.origin) || /市$/.test(parsed.origin);
+        const destHasBuildingName = /(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|科技|商务|大厦)/.test(parsed.destination);
+
+        // 检查 distance 等其他字段是否藏了真正的终点（地址特征词 + 不是纯数字）
+        const distanceVal = getWordValue(fi.distance) || getWordValue(result.distance) || '';
+        const distanceLooksLikeDest = distanceVal &&
+          /(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|路|街|口|门|科技|商务|大厦|村|苑|阁|轩|居)/.test(distanceVal) &&
+          !/^[\d.]+$/.test(distanceVal) &&
+          distanceVal.length >= 2;
+
+        if (originIsJustCity && destHasBuildingName) {
+          console.log('[OCR] ⚠️ 检测到可能的地址截断: origin=' + parsed.origin + ' dest=' + parsed.destination);
+
+          if (distanceLooksLikeDest) {
+            // 场景: origin被截成城市, dest是起点剩余部分, distance才是真终点 → 合并修正
+            console.log('[OCR] ✅ 发现distance字段含有效地址("' + distanceVal + '"),执行修正');
+            const mergedOrigin = parsed.origin + parsed.destination;
+            parsed.origin = cleanAddressField(mergedOrigin);
+            parsed.destination = cleanAddressField(distanceVal);
+
+          } else {
+            // 没有 distance 可用，尝试从 rawText 中找更多线索
+            // 检查 destination 行后面是否还有地址行（可能是真正的终点）
+            const allTextLines = rawText.split('\n');
+            let destLineIdx = -1;
+            for (let i = 0; i < allTextLines.length; i++) {
+              if (/终点/.test(allTextLines[i])) { destLineIdx = i; break; }
+            }
+
+            if (destLineIdx >= 0 && destLineIdx + 1 < allTextLines.length) {
+              const afterDest = allTextLines[destLineIdx + 1].trim();
+              const afterDestIsAddr = /^(?![\d])[\u4e00-\u9fa5]{2,}/.test(afterDest) &&
+                /(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|路|街|口|门|科技|商务|村|苑|阁|轩|居)/.test(afterDest) &&
+                !/(有限公司|金额|时间|日期|车型|服务商|序号|发票)/.test(afterDest);
+
+              if (afterDestIsAddr) {
+                console.log('[OCR] ✅ 终点行后续发现地址行("' + afterDest + '"),执行修正');
+                const mergedOrigin = parsed.origin + parsed.destination;
+                parsed.origin = cleanAddressField(mergedOrigin);
+                parsed.destination = cleanAddressField(afterDest);
+              } else {
+                console.log('[OCR] ⚠️ 检测到地址截断但无法自动修复，保留原始值');
+              }
+            } else {
+              console.log('[OCR] ⚠️ 检测到地址截断但无法自动修复，保留原始值');
+            }
+          }
+        }
+      }
+
     } else if (type === 'vat_invoice') {
       parsed.type = '增值税发票';
       extractedDate = getWordValue(result.InvoiceDate);
@@ -309,12 +368,18 @@ function cleanAddressField(val) {
 }
 
 // Call Baidu financial document OCR (multiple_invoice API)
-async function callBaiduFinancialOcr(imageBase64) {
+// imageBase64: base64 encoded image or PDF
+// isPdf: if true, use pdf_file param; otherwise use image param
+async function callBaiduFinancialOcr(imageBase64, isPdf = false) {
   const token = await getBaiduAccessToken();
   
-  // Use multiple_invoice API (supports all financial documents)
   const body = new URLSearchParams();
-  body.append('image', imageBase64);
+  if (isPdf) {
+    body.append('pdf_file', imageBase64);
+    console.log('[OCR] Using pdf_file param for PDF');
+  } else {
+    body.append('image', imageBase64);
+  }
   body.append('location', 'false');
   
   const result = await callBaiduApi(token, '/rest/2.0/ocr/v1/multiple_invoice', body.toString());
@@ -569,8 +634,10 @@ app.post('/api/ocr', upload.single('image'), async (req, res) => {
 
     const b64 = req.file.buffer.toString('base64');
     const ocrType = req.body.type || 'invoice'; // 'invoice' or 'overtime'
+    const isPdf = req.file.mimetype === 'application/pdf' || 
+                  (req.file.originalname && req.file.originalname.toLowerCase().endsWith('.pdf'));
     
-    console.log('[OCR] Processing:', req.file.originalname || 'unknown', '(' + req.file.size + 'bytes), type:', ocrType);
+    console.log('[OCR] Processing:', req.file.originalname || 'unknown', '(' + req.file.size + 'bytes), type:', ocrType, 'isPdf:', isPdf);
 
     let parsedResults = [];
     let rawText = '';
@@ -590,7 +657,7 @@ app.post('/api/ocr', upload.single('image'), async (req, res) => {
     } else {
       // Use Financial OCR for invoices
       console.log('[OCR] Using Financial OCR for invoices...');
-      const financialResult = await callBaiduFinancialOcr(b64);
+      const financialResult = await callBaiduFinancialOcr(b64, isPdf);
       
       if (financialResult) {
         const financialData = parseMultipleInvoiceResult(financialResult);
@@ -628,7 +695,7 @@ app.post('/api/ocr', upload.single('image'), async (req, res) => {
     
   } catch (e) {
     console.error('[OCR Error]', e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: e.message, stack: e.stack });
   }
 });
 

@@ -1,4 +1,4 @@
-﻿<!-- CACHE-BUST: 20260618-1205-GIT-AUTO-DEPLOY -->
+﻿<!-- CACHE-BUST: 20260618-1610-fix-address-split -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -7,7 +7,7 @@
   <!-- v20260617-1920 fix: new file to bypass CDN cache -->
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
-  <title>打车发票 & 加班记录核验系统 v20260618-1140</title>
+  <title>打车发票 &amp; 加班记录核验系统 v20260618-1610</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -820,67 +820,94 @@ function extractInvoiceFields(rawText) {
   }
   console.log('[前端-发票解析] 金额:', result.amount || '(未提取)');
 
-  // ── 起点/终点（策略1: 表格行解析）──
+  // ── 起点/终点（策略1: 表格行解析 / 冒号行解析）──
   const lines = rawText.split('\n');
   let headerIdx = -1;
   for (let i = 0; i < lines.length; i++) {
     if (/起点/.test(lines[i])) { headerIdx = i; break; }
   }
-  if (headerIdx >= 0 && headerIdx + 1 < lines.length) {
-    const dataLine = lines[headerIdx + 1];
-    console.log('[前端-发票解析] 找到表头行[' + headerIdx + ']:', lines[headerIdx]);
-    console.log('[前端-发票解析] 数据行[' + (headerIdx+1) + ']:', dataLine);
-    
-    const cells = dataLine.trim().split(/\s+/).filter(c => c);
-    // 过滤掉纯数字、日期、时间、金额等非地址内容
-    const addrCells = cells.filter(c => {
-      if (/^\d+$/.test(c)) return false;
-      if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}$/.test(c)) return false;
-      if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}$/.test(c)) return false;
-      if (/^\d{1,2}:\d{2}$/.test(c)) return false;
-      if (/(\d+\.?\d*)元?$/.test(c) && parseFloat(c) > 4) return false;
-      if (/^(序号|服务商|车型|城市|及时|阳光|特惠|经济)$/.test(c)) return false;
-      // 过滤公司名/法人实体（不用$锚定，防止末尾有标点或拆分时漏过）
-      if (/有限公司|股份公司|集团公司|控股公司|有限责任公司|科技有限公司|网络技术|信息技术/.test(c)) return false;
-      // 过滤 "XXX(YYY)" 格式且不含地点特征词的长字符串（典型公司名模式，如"腾讯科技(北京)"）
-      if (/^[\u4e00-\u9fa5]+[(（][\u4e00-\u9fa5]+[）)]$/.test(c) && c.length > 4 && !/(大厦|广场|园区| Mall |mall|机场|站|路|街|路口|门|酒店|商场|写字楼)/.test(c)) return false;
-      return true;
-    });
-    console.log('[前端-发票解析] 过滤后候选地址:', addrCells);
+  if (headerIdx >= 0) {
+    const headerLine = lines[headerIdx];
+    console.log('[前端-发票解析] 找到含"起点"的行[' + headerIdx + ']:', headerLine);
 
-    // 优先取含具体地点特征字的中文片段（排除泛化的"科技""中心"等公司常用词）
-    const placeCells = addrCells.filter(c => 
-      /[\u4e00-\u9fa5]{2,}/.test(c) && /(大厦|楼|园区|广场|机场|火车站|地铁站|路口|南门|北门|东门|西门|酒店|商场|写字楼|医院|学校|银行| Mall | mall )/.test(c)
-    );
-    if (placeCells.length >= 2) {
-      result.origin = placeCells[0];
-      result.dest = placeCells[1];
-    } else if (addrCells.length >= 2) {
-      // 兜底：取最后两个中文单元格，但严格排除公司名
-      const chineseCells = addrCells.filter(c => 
-        /[\u4e00-\u9fa5]/.test(c) && !/(有限公司|股份公司|集团公司|科技公司|网络技术|信息技术)/.test(c)
+    // 检测格式：判断是表格格式（表头+数据）还是冒号行格式（起点: xxx \n 终点: yyy）
+    // 冒号行格式的特征：当前行是 "起点: <值>" 且下一行以 "终点:" 开头
+    // 表格格式的特征：当前行同时包含 "起点" 和 "终点"（作为表头列）
+    const hasBothHeaders = /终点/.test(headerLine);
+    const isColonFormat = /起点[：:\s]+[^\s终点]/.test(headerLine) && !hasBothHeaders;
+    const nextLine = (headerIdx + 1 < lines.length) ? lines[headerIdx + 1].trim() : '';
+    const nextIsDest = /^终点[：:\s]/.test(nextLine);
+
+    if (isColonFormat && nextIsDest) {
+      // 【冒号行格式】"起点: xxx" 在当前行，"终点: yyy" 在下一行
+      console.log('[前端-发票解析] 检测到冒号行格式，从标签行提取');
+      console.log('[前端-发票解析] 数据行(下一行)[' + (headerIdx+1) + ']:', nextLine);
+      const om2 = headerLine.match(/起点[：:\s]+([^\s终点元金额]{2,50})/i);
+      if (om2) result.origin = om2[1].trim().replace(/[：:，,。]$/, '');
+      const dm2 = nextLine.match(/终点[：:\s]+([^\s起点元金额]{2,50})/i);
+      if (dm2) result.dest = dm2[1].trim().replace(/[：:，,。]$/, '');
+
+    } else if (!isColonFormat && headerIdx + 1 < lines.length) {
+      // 【表格格式】当前行是纯表头（如 "起点  终点"），数据在下一行
+      const dataLine = lines[headerIdx + 1];
+      console.log('[前端-发票解析] 检测到表格格式，取下一行为数据');
+      console.log('[前端-发票解析] 数据行[' + (headerIdx+1) + ']:', dataLine);
+      
+      const cells = dataLine.trim().split(/\s+/).filter(c => c);
+      // 过滤掉纯数字、日期、时间、金额等非地址内容
+      const addrCells = cells.filter(c => {
+        if (/^\d+$/.test(c)) return false;
+        if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}$/.test(c)) return false;
+        if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}$/.test(c)) return false;
+        if (/^\d{1,2}:\d{2}$/.test(c)) return false;
+        if (/(\d+\.?\d*)元?$/.test(c) && parseFloat(c) > 4) return false;
+        if (/^(序号|服务商|车型|城市|及时|阳光|特惠|经济)$/.test(c)) return false;
+        // 过滤公司名/法人实体
+        if (/有限公司|股份公司|集团公司|控股公司|有限责任公司|科技有限公司|网络技术|信息技术/.test(c)) return false;
+        // 过滤 "XXX(YYY)" 格式且不含地点特征词的长字符串
+        if (/^[\u4e00-\u9fa5]+[(（][\u4e00-\u9fa5]+[）)]$/.test(c) && c.length > 4 && !/(大厦|广场|园区| Mall |mall|机场|站|路|街|路口|门|酒店|商场|写字楼)/.test(c)) return false;
+        // 【关键修复】过滤地址标签文本
+        if (/^(起点|终点|始发|目的|出发|到达|上车|下车|出发地|到达地|起始|终止)[：:\s]*$/.test(c)) return false;
+        return true;
+      });
+      console.log('[前端-发票解析] 过滤后候选地址:', addrCells);
+
+      // 优先取含具体地点特征字的中文片段
+      const placeCells = addrCells.filter(c => 
+        /[\u4e00-\u9fa5]{2,}/.test(c) && /(大厦|楼|园区|广场|机场|火车站|地铁站|路口|南门|北门|东门|西门|酒店|商场|写字楼|医院|学校|银行| Mall | mall )/.test(c)
       );
-      if (chineseCells.length >= 2) {
-        // 再筛一次：排除 "名称(地区)" 格式的纯公司名
-        const finalCells = chineseCells.filter(c => {
-          if (/^[\u4e00-\u9fa5]+[(（][\u4e00-\u9fa5]+[）)]$/.test(c) && c.length > 4) return false;
-          return true;
-        });
-        if (finalCells.length >= 2) {
-          result.origin = finalCells[finalCells.length - 2];
-          result.dest = finalCells[finalCells.length - 1];
+      if (placeCells.length >= 2) {
+        result.origin = placeCells[0];
+        result.dest = placeCells[1];
+      } else if (addrCells.length >= 2) {
+        const chineseCells = addrCells.filter(c => 
+          /[\u4e00-\u9fa5]/.test(c) && !/(有限公司|股份公司|集团公司|科技公司|网络技术|信息技术)/.test(c)
+        );
+        if (chineseCells.length >= 2) {
+          const finalCells = chineseCells.filter(c => {
+            if (/^[\u4e00-\u9fa5]+[(（][\u4e00-\u9fa5]+[）)]$/.test(c) && c.length > 4) return false;
+            return true;
+          });
+          if (finalCells.length >= 2) {
+            result.origin = finalCells[finalCells.length - 2];
+            result.dest = finalCells[finalCells.length - 1];
+          }
         }
       }
+    } else {
+      console.log('[前端-发票解析] 未识别的标准格式，跳过策略1');
     }
   }
 
-  // 策略2: 冒号格式
-  if (!result.origin) {
-    const om = flatText.match(/起点[：:\s]+([^\s终点\d元金额]{2,40})/i);
+  // 策略2: 冒号格式（兜底 + 覆盖策略1的错误值）
+  const originLooksLikeLabel = result.origin && /^(起点|终点|始发|目的|出发|到达)[：:\s]*$/.test(result.origin);
+  const destLooksLikeLabel = result.dest && /^(起点|终点|始发|目的|出发|到达)[：:\s]*$/.test(result.dest);
+  if (!result.origin || originLooksLikeLabel) {
+    const om = flatText.match(/起点[：:\s]+([^\s终点元金额]{2,50})/i);
     if (om) result.origin = om[1].trim().replace(/[：:，,。]$/, '');
   }
-  if (!result.dest) {
-    const dm = flatText.match(/终点[：:\s]+([^\s起点\d元金额]{2,40})/i);
+  if (!result.dest || destLooksLikeLabel) {
+    const dm = flatText.match(/终点[：:\s]+([^\s起点元金额]{2,50})/i);
     if (dm) result.dest = dm[1].trim().replace(/[：:，,。]$/, '');
   }
 

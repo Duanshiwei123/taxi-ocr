@@ -193,6 +193,55 @@ function parseMultipleInvoiceResult(data) {
       }
       parsed.invoice_no = '';
 
+      // ── Post-fix: detect & correct taxi_online_ticket address field confusion ──
+      // Baidu OCR sometimes splits long addresses across fields:
+      //   start_place=city(truncated), destination_place=rest of origin, distance=real destination
+      const fi = (items.length > 0) ? items[0] : null;
+      if (fi && parsed.origin && parsed.destination) {
+        const originIsJustCity = /^[\u4e00-\u9fa5]{2,4}$/.test(parsed.origin) || /\u5E02$/.test(parsed.origin);
+        const destHasBuildingName = /(\u5927\u53A6|\u5E7F\u573A|\u56ED\u533A| Mall |mall|\u697C|\u4E2D\u5FC3|\u673A\u573A|\u7AD9|\u5C0F\u533A|\u82B1\u56ED|\u516C\u5BD3|\u5199\u5B57\u697C|\u79D1\u6280|\u5546\u52A1|\u5927\u53A6)/.test(parsed.destination);
+
+        // Check distance field for real destination (address-like, not pure numeric)
+        const distanceVal = getWordValue(fi.distance) || getWordValue(result.distance) || '';
+        const distanceLooksLikeDest = distanceVal &&
+          /(\u5927\u53A6|\u5E7F\u573A|\u56ED\u533A| Mall |mall|\u697C|\u4E2D\u5FC3|\u673A\u573A|\u7AD9|\u5C0F\u533A|\u82B1\u56ED|\u516C\u5BD3|\u5199\u5B97\u697C|\u8DEF|\u8857|\u53E3|\u95E8|\u79D1\u6280|\u5546\u52A1|\u5927\u53A6|\u6751|\u82D1|\u9601|\u8F69|\u5C45)/.test(distanceVal) &&
+          !/^[\d.]+$/.test(distanceVal) && distanceVal.length >= 2;
+
+        if (originIsJustCity && destHasBuildingName) {
+          console.log('[OCR] Suspicious address truncation detected: origin=' + parsed.origin + ' dest=' + parsed.destination);
+
+          if (distanceLooksLikeDest) {
+            console.log('[OCR] Found valid address in distance("' + distanceVal + '"), correcting');
+            const mergedOrigin = parsed.origin + parsed.destination;
+            parsed.origin = cleanAddressField(mergedOrigin);
+            parsed.destination = cleanAddressField(distanceVal);
+          } else {
+            // Try finding extra address line after destination line in raw text
+            const allTextLines = rawText.split('\n');
+            let destLineIdx = -1;
+            for (let i = 0; i < allTextLines.length; i++) {
+              if (/\u7EC8\u70B9/.test(allTextLines[i])) { destLineIdx = i; break; }
+            }
+            if (destLineIdx >= 0 && destLineIdx + 1 < allTextLines.length) {
+              const afterDest = allTextLines[destLineIdx + 1].trim();
+              const afterDestIsAddr = /^(?![\d])[\u4e00-\u9fa5]{2,}/.test(afterDest) &&
+                /(\u5927\u53A6|\u5E7F\u573A|\u56ED\u533A| Mall |mall|\u697C|\u4E2D\u5FC3|\u673A\u573A|\u7AD9|\u5C0F\u533A|\u82B1\u56ED|\u516C\u5BD3|\u5199\u5B57\u697C|\u8DEF|\u8857|\u53E3|\u95E8|\u79D1\u6280|\u5546\u52A1|\u6751|\u82D1|\u9601|\u8F69|\u5C45)/.test(afterDest) &&
+                !/(\u6709\u9650\u516C\u53F8|\u91D1\u989D|\u65F6\u95F4|\u65E5\u671F|\u8F66\u578B|\u670D\u52A1\u5546|\u5E8F\u53F7|\u53D1\u7968)/.test(afterDest);
+              if (afterDestIsAddr) {
+                console.log('[OCR] Found address line after dest("' + afterDest + '"), correcting');
+                const mergedOrigin = parsed.origin + parsed.destination;
+                parsed.origin = cleanAddressField(mergedOrigin);
+                parsed.destination = cleanAddressField(afterDest);
+              } else {
+                console.log('[OCR] Address truncation detected but cannot auto-fix');
+              }
+            } else {
+              console.log('[OCR] Address truncation detected but cannot auto-fix');
+            }
+          }
+        }
+      }
+
     } else if (type === 'vat_invoice') {
       parsed.type = '\u589E\u503C\u7A0E\u53D1\u7968';
       extractedDate = getWordValue(result.InvoiceDate);
@@ -291,52 +340,69 @@ function parseGeneralOcrResult(data) {
   }
 
   // ── Extract origin / destination from OCR text ──
-  // 策略1: 按行查找表头+数据行的表格格式（如高德行程单）
+  // 策略1: 智能识别表格格式 vs 冒号行格式
   const lines = fullText.split('\n');
   let headerLineIdx = -1;
   for (let i = 0; i < lines.length; i++) {
     if (/起点/.test(lines[i])) { headerLineIdx = i; break; }
   }
-  if (headerLineIdx >= 0 && headerLineIdx + 1 < lines.length) {
-    const dataLine = lines[headerLineIdx + 1];
-    if (/^\s*\d/.test(dataLine)) {
-      const parts = dataLine.trim().split(/\s+/).filter(p => p);
-      const candidates = parts.filter(p => {
-        if (/^\d+$/.test(p)) return false;
-        if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}$/.test(p)) return false;
-        if (/^\d{1,2}:\d{2}$/.test(p)) return false;
-        if (/\d+(\.\d+)?元?$/.test(p)) return false;
-        if (/^(序号|服务商|车型|城市|金额|及时|阳光|特惠|经济)$/.test(p)) return false;
-        return true;
-      });
-      // 取含地点特征字的中文片段作为地址候选
-      const addrCandidates = candidates.filter(c =>
-        /[\u4e00-\u9fa5]{2,}/.test(c) &&
-        /(大厦|楼|园|区|广场|机场|站|路|街|口|门|中心|科技|南区|北区)/.test(c)
-      );
-      if (addrCandidates.length >= 2) {
-        result.origin = addrCandidates[0];
-        result.destination = addrCandidates[1];
-      } else if (candidates.length >= 2) {
-        const chineseCandidates = candidates.filter(c => /[\u4e00-\u9fa5]/.test(c));
-        if (chineseCandidates.length >= 2) {
-          result.origin = chineseCandidates[chineseCandidates.length - 2];
-          result.destination = chineseCandidates[chineseCandidates.length - 1];
+  if (headerLineIdx >= 0) {
+    const hline = lines[headerLineIdx];
+    const hasBothHeaders = /终点/.test(hline);
+    const isColonFormat = /起点[：:\s]+[^\s终点]/.test(hline) && !hasBothHeaders;
+    const nextLineRaw = (headerLineIdx + 1 < lines.length) ? lines[headerLineIdx + 1].trim() : '';
+    const nextIsDest = /^终点[：:\s]/.test(nextLineRaw);
+
+    if (isColonFormat && nextIsDest) {
+      // 冒号行格式: "起点: xxx" 在当前行, "终点: yyy" 在下一行
+      const om2 = hline.match(/起点[\uFF1A:\s]+([^\s终点元金额]{2,50})/i);
+      if (om2) result.origin = om2[1].trim().replace(/[：:，,。]$/, '');
+      const dm2 = nextLineRaw.match(/终点[\uFF1A:\s]+([^\s起点元金额]{2,50})/i);
+      if (dm2) result.destination = dm2[1].trim().replace(/[：:，,。]$/, '');
+    } else if (!isColonFormat && headerLineIdx + 1 < lines.length) {
+      // 表格格式: 当前行为纯表头, 数据在下一行
+      const dataLine = lines[headerLineIdx + 1];
+      if (/^\s*\d/.test(dataLine)) {
+        const parts = dataLine.trim().split(/\s+/).filter(p => p);
+        const candidates = parts.filter(p => {
+          if (/^\d+$/.test(p)) return false;
+          if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}$/.test(p)) return false;
+          if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}$/.test(p)) return false;
+          if (/^\d{1,2}:\d{2}$/.test(p)) return false;
+          if (/\d+(\.\d+)?元?$/.test(p)) return false;
+          if (/^(序号|服务商|车型|城市|金额|及时|阳光|特惠|经济)$/.test(p)) return false;
+          // 【关键修复】过滤地址标签文本
+          if (/^(起点|终点|始发|目的|出发|到达)[：:\s]*$/.test(p)) return false;
+          return true;
+        });
+        const addrCandidates = candidates.filter(c =>
+          /[\u4e00-\u9fa5]{2,}/.test(c) &&
+          /(大厦|楼|园|区|广场|机场|站|路|街|口|门|中心|科技|南区|北区)/.test(c)
+        );
+        if (addrCandidates.length >= 2) {
+          result.origin = addrCandidates[0];
+          result.destination = addrCandidates[1];
+        } else if (candidates.length >= 2) {
+          const chineseCandidates = candidates.filter(c => /[\u4e00-\u9fa5]/.test(c));
+          if (chineseCandidates.length >= 2) {
+            result.origin = chineseCandidates[chineseCandidates.length - 2];
+            result.destination = chineseCandidates[chineseCandidates.length - 1];
+          }
         }
       }
     }
   }
 
-  // 策略2: 冒号格式 "起点：xxx" / "终点：xxx"
-  if (!result.origin || !result.destination) {
-    if (!result.origin) {
-      const om = flatText.match(/起点[\uFF1A:\s]+([^\s终点\d元金额]{2,40})/i);
-      if (om) result.origin = om[1].trim().replace(/[：:，,。]$/, '');
-    }
-    if (!result.destination) {
-      const dm = flatText.match(/终点[\uFF1A:\s]+([^\s起点\d元金额]{2,40})/i);
-      if (dm) result.destination = dm[1].trim().replace(/[：:，,。]$/, '');
-    }
+  // 策略2: 冒号格式（兜底 + 覆盖标签类错误值）
+  const originIsLabel = result.origin && /^(起点|终点|始发|目的|出发|到达)[：:\s]*$/.test(result.origin);
+  const destIsLabel = result.destination && /^(起点|终点|始发|目的|出发|到达)[：:\s]*$/.test(result.destination);
+  if (!result.origin || originIsLabel) {
+    const om = flatText.match(/起点[\uFF1A:\s]+([^\s终点元金额]{2,50})/i);
+    if (om) result.origin = om[1].trim().replace(/[：:，,。]$/, '');
+  }
+  if (!result.destination || destIsLabel) {
+    const dm = flatText.match(/终点[\uFF1A:\s]+([^\s起点元金额]{2,50})/i);
+    if (dm) result.destination = dm[1].trim().replace(/[：:，,。]$/, '');
   }
 
   console.log('[parseGeneral] origin:', JSON.stringify(result.origin), 'dest:', JSON.stringify(result.destination));
