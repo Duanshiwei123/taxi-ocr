@@ -826,10 +826,10 @@ function extractInvoiceFields(rawText) {
       if (/^\d{1,2}:\d{2}$/.test(c)) return false;
       if (/(\d+\.?\d*)元?$/.test(c) && parseFloat(c) > 4) return false;
       if (/^(序号|服务商|车型|城市|及时|阳光|特惠|经济)$/.test(c)) return false;
-      // 过滤公司名/法人实体（不是地址）
-      if (/(有限公司|股份公司|集团公司|控股公司|有限责任公司|科技有限公司|网络技术|信息技术)$/.test(c)) return false;
-      // 过滤过长的非地址字符串（>15字且不含地点特征词）
-      if (c.length > 15 && !/(大厦|楼|园|区|广场|机场|站|路|街|口|门|中心|南区|北区|大厦|酒店|商场|写字楼|大厦)/.test(c)) return false;
+      // 过滤公司名/法人实体（不用$锚定，防止末尾有标点或拆分时漏过）
+      if (/有限公司|股份公司|集团公司|控股公司|有限责任公司|科技有限公司|网络技术|信息技术/.test(c)) return false;
+      // 过滤 "XXX(YYY)" 格式且不含地点特征词的长字符串（典型公司名模式，如"腾讯科技(北京)"）
+      if (/^[\u4e00-\u9fa5]+[(（][\u4e00-\u9fa5]+[）)]$/.test(c) && c.length > 4 && !/(大厦|广场|园区| Mall |mall|机场|站|路|街|路口|门|酒店|商场|写字楼)/.test(c)) return false;
       return true;
     });
     console.log('[前端-发票解析] 过滤后候选地址:', addrCells);
@@ -842,13 +842,20 @@ function extractInvoiceFields(rawText) {
       result.origin = placeCells[0];
       result.dest = placeCells[1];
     } else if (addrCells.length >= 2) {
-      // 兜底：取最后两个中文单元格，但排除公司名
+      // 兜底：取最后两个中文单元格，但严格排除公司名
       const chineseCells = addrCells.filter(c => 
-        /[\u4e00-\u9fa5]/.test(c) && !/(有限公司|股份公司|集团公司|科技公司|网络技术|信息技术)$/.test(c)
+        /[\u4e00-\u9fa5]/.test(c) && !/(有限公司|股份公司|集团公司|科技公司|网络技术|信息技术)/.test(c)
       );
       if (chineseCells.length >= 2) {
-        result.origin = chineseCells[chineseCells.length - 2];
-        result.dest = chineseCells[chineseCells.length - 1];
+        // 再筛一次：排除 "名称(地区)" 格式的纯公司名
+        const finalCells = chineseCells.filter(c => {
+          if (/^[\u4e00-\u9fa5]+[(（][\u4e00-\u9fa5]+[）)]$/.test(c) && c.length > 4) return false;
+          return true;
+        });
+        if (finalCells.length >= 2) {
+          result.origin = finalCells[finalCells.length - 2];
+          result.dest = finalCells[finalCells.length - 1];
+        }
       }
     }
   }
