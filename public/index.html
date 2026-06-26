@@ -1,13 +1,13 @@
-﻿<!-- CACHE-BUST: 20260626-1805-export-zip-with-images -->
+﻿<!-- CACHE-BUST: 20260626-1810-exceljs-embed-images -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <!-- v20260626-1805 fix: export XLSX with proof images in ZIP (SheetJS free lacks image support) -->
+  <!-- v20260626-1810 fix: use ExcelJS to embed proof images directly into XLSX cells -->
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
-  <title>打车发票 &amp; 加班记录核验系统 v20260626-1805</title>
+  <title>打车发票 &amp; 加班记录核验系统 v20260626-1810</title>
 
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -270,8 +270,10 @@
       pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     }
   </script>
-  <!-- SheetJS for xlsx export -->
+  <!-- SheetJS for xlsx export (kept for compatibility, ExcelJS used for export) -->
   <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
+  <!-- ExcelJS for xlsx export with embedded images -->
+  <!-- loaded on demand in exportXLSX() to avoid blocking page load -->
 </head>
 <body>
   <!-- v20260618-1053-debug-force -->
@@ -2025,92 +2027,20 @@ async function exportXLSX() {
     empMap.get(key).push(inv);
   });
 
-  const rows = [['序号','部门','项目组','工号','账号','姓名','起点','终点','网约车(计算过程)','出租车/公交/其他(计算过程)','小计金额','是否客户结算','备注','乘车日期','加班凭证']];
-
-  let seq = 0;
-  empMap.forEach((invoices, empName) => {
-    seq++;
-    const onlineAmts = [], taxiAmts = [], allDates = [], allDests = [];
-    invoices.forEach(inv => {
-      const amt = parseFloat(inv.amount) || 0;
-      if (/出租|的士|taxi/i.test(inv.type)) {
-        taxiAmts.push(amt);
-      } else {
-        onlineAmts.push(amt);
-      }
-      // 收集日期
-      if (inv.date) {
-        let d = inv.date.replace(/\./g,'/').replace(/-/g,'/');
-        if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(d)) {
-          const p = d.split('/');
-          d = p[0]+'/'+String(p[1]).padStart(2,'0')+'/'+String(p[2]).padStart(2,'0');
-        }
-        if (!allDates.includes(d)) allDates.push(d);
-      }
-      // 收集终点
-      if (inv.dest && !allDests.includes(inv.dest)) {
-        allDests.push(inv.dest);
-      }
-    });
-    const onlineTotal = onlineAmts.reduce((a, b) => a + b, 0);
-    const taxiTotal = taxiAmts.reduce((a, b) => a + b, 0);
-    const grandTotal = onlineTotal + taxiTotal;
-
-    let onlineStr = '';
-    if (onlineAmts.length > 0) onlineStr = onlineAmts.join('+') + '=' + onlineTotal;
-    let taxiStr = '';
-    if (taxiAmts.length > 0) taxiStr = taxiAmts.join('+') + '=' + taxiTotal;
-
-    // 把 empName 拆成账号（英文）和姓名（中文）
-    let empAccount = '', empCnName = '';
-    if (empName) {
-      const parts = empName.split(' ');
-      const engPart = parts.find(p => /^v_/i.test(p));
-      const cnPart = parts.find(p => /^[\u4e00-\u9fa5]+$/.test(p));
-      if (engPart) empAccount = engPart.replace(/v-/i, 'v_').toLowerCase();
-      if (cnPart) empCnName = cnPart;
-      if (!empAccount && !empCnName) {
-        if (/^v_/i.test(empName)) {
-          empAccount = empName.replace(/v-/i, 'v_').toLowerCase();
-        } else if (/^[\u4e00-\u9fa5]+$/.test(empName)) {
-          empCnName = empName;
-        } else {
-          empAccount = empName;
-        }
-      }
-    }
-
-    // 查找该员工是否有加班凭证（收集所有匹配的凭证图片 dataURL）
-    const proofImages = [];
-    if (otHistory && otHistory.length > 0) {
-      otHistory.forEach(snap => {
-        if (snap.employeeName === empName && snap.canvasDataUrl) {
-          proofImages.push(snap.canvasDataUrl);
-        }
-      });
-    }
-
-    const destDisplay = allDests.join('/');
-
-    rows.push([
-      seq, '', '', '', empAccount, empCnName,
-      '万利达',
-      destDisplay || '',
-      onlineStr || '', taxiStr || '', grandTotal,
-      '是', '等候过长时间线上无平台无司机接单，故当下先使用线下打车(提供等待截图)',
-      allDates.join('、'),
-      proofImages.length > 0 ? '见图片' : ''
-    ]);
-  });
-
-  // 收集每个员工的凭证图片（用于导出时保存为独立文件）
-  const empProofImages = []; // { account, cnName, images: string[] }
+  // 收集每个员工的凭证图片（用于 ExcelJS 嵌入图片）
+  const empProofMap = new Map(); // empName → { account, cnName, images: [{dataUrl, buffer}] }
   empMap.forEach((invoices, empName) => {
     const imgs = [];
     if (otHistory && otHistory.length > 0) {
       otHistory.forEach(snap => {
         if (snap.employeeName === empName && snap.canvasDataUrl) {
-          imgs.push(snap.canvasDataUrl);
+          // 把 dataURL 转成 ArrayBuffer
+          const base64 = snap.canvasDataUrl.replace(/^data:image\/(png|jpeg|jpg);base64,/, '');
+          const binaryStr = atob(base64);
+          const buf = new ArrayBuffer(binaryStr.length);
+          const view = new Uint8Array(buf);
+          for (let i = 0; i < binaryStr.length; i++) view[i] = binaryStr.charCodeAt(i);
+          imgs.push({ dataUrl: snap.canvasDataUrl, buffer: buf });
         }
       });
     }
@@ -2126,73 +2056,165 @@ async function exportXLSX() {
         else if (/^[\u4e00-\u9fa5]+$/.test(empName)) cnName = empName;
         else account = empName;
       }
-      empProofImages.push({ account, cnName, images: imgs });
+      empProofMap.set(empName, { account, cnName, images: imgs });
     }
   });
 
-  // 使用 SheetJS 生成 xlsx 文件
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.aoa_to_sheet(rows);
+  // 加载 ExcelJS
+  if (typeof ExcelJS === 'undefined') {
+    await loadScript('https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js');
+  }
 
-  // 设置列宽
-  ws['!cols'] = [
-    { wch: 6 },  // 序号
-    { wch: 12 }, // 部门
-    { wch: 12 }, // 项目组
-    { wch: 10 }, // 工号
-    { wch: 15 }, // 账号
-    { wch: 10 }, // 姓名
-    { wch: 10 }, // 起点
-    { wch: 20 }, // 终点
-    { wch: 20 }, // 网约车
-    { wch: 20 }, // 出租车
-    { wch: 10 }, // 小计金额
-    { wch: 10 }, // 是否客户结算
-    { wch: 40 }, // 备注
-    { wch: 20 }, // 乘车日期
-    { wch: 18 }  // 加班凭证
-  ];
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('交通费用明细汇总表');
 
-  XLSX.utils.book_append_sheet(wb, ws, '交通费用明细汇总表');
+  // ── 表头 ──
+  const headers = ['序号','部门','项目组','工号','账号','姓名','起点','终点','网约车(计算过程)','出租车/公交/其他(计算过程)','小计金额','是否客户结算','备注','乘车日期','加班凭证'];
+  ws.addRow(headers);
+  // 表头样式
+  const headerRow = ws.getRow(1);
+  headerRow.eachCell(cell => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFC000' } };
+    cell.font = { bold: true, size: 11 };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    cell.border = {
+      top: { style: 'thin' }, left: { style: 'thin' },
+      bottom: { style: 'thin' }, right: { style: 'thin' }
+    };
+  });
 
-  // 如果有凭证图片，用 JSZip 打包 xlsx + 图片文件夹
-  if (empProofImages.length > 0) {
-    // 加载 JSZip
-    if (typeof JSZip === 'undefined') {
-      await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+  // ── 数据行 ──
+  let seq = 0;
+  const IMG_COL = 15; // 加班凭证列 = 第15列
+  const IMG_WIDTH = 120;  // 图片显示宽度（px 近似）
+  const IMG_HEIGHT = 80;  // 图片显示高度（px 近似）
+  const PX_TO_EMU = 9525; // 1px ≈ 9525 EMU
+
+  const empList = []; // 保持顺序
+  empMap.forEach((invoices, empName) => empList.push({ empName, invoices }));
+
+  for (const { empName, invoices } of empList) {
+    seq++;
+    const onlineAmts = [], taxiAmts = [], allDates = [], allDests = [];
+    invoices.forEach(inv => {
+      const amt = parseFloat(inv.amount) || 0;
+      if (/出租|的士|taxi/i.test(inv.type)) {
+        taxiAmts.push(amt);
+      } else {
+        onlineAmts.push(amt);
+      }
+      if (inv.date) {
+        let d = inv.date.replace(/\./g,'/').replace(/-/g,'/');
+        if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(d)) {
+          const p = d.split('/');
+          d = p[0]+'/'+String(p[1]).padStart(2,'0')+'/'+String(p[2]).padStart(2,'0');
+        }
+        if (!allDates.includes(d)) allDates.push(d);
+      }
+      if (inv.dest && !allDests.includes(inv.dest)) {
+        allDests.push(inv.dest);
+      }
+    });
+    const onlineTotal = onlineAmts.reduce((a, b) => a + b, 0);
+    const taxiTotal = taxiAmts.reduce((a, b) => a + b, 0);
+    const grandTotal = onlineTotal + taxiTotal;
+
+    let onlineStr = '';
+    if (onlineAmts.length > 0) onlineStr = onlineAmts.join('+') + '=' + onlineTotal;
+    let taxiStr = '';
+    if (taxiAmts.length > 0) taxiStr = taxiAmts.join('+') + '=' + taxiTotal;
+
+    // 拆分账号和姓名
+    let empAccount = '', empCnName = '';
+    if (empName) {
+      const parts = empName.split(' ');
+      const engPart = parts.find(p => /^v_/i.test(p));
+      const cnPart = parts.find(p => /^[\u4e00-\u9fa5]+$/.test(p));
+      if (engPart) empAccount = engPart.replace(/v-/i, 'v_').toLowerCase();
+      if (cnPart) empCnName = cnPart;
+      if (!empAccount && !empCnName) {
+        if (/^v_/i.test(empName)) empAccount = empName.replace(/v-/i, 'v_').toLowerCase();
+        else if (/^[\u4e00-\u9fa5]+$/.test(empName)) empCnName = empName;
+        else empAccount = empName;
+      }
     }
 
-    const zip = new JSZip();
-    const proofFolder = zip.folder('加班凭证图片');
+    const destDisplay = allDests.join('/');
+    const hasProof = empProofMap.has(empName);
 
-    // 把凭证图片保存为 PNG 文件（按员工姓名命名）
-    empProofImages.forEach(({ account, cnName, images }) => {
-      const safeName = (cnName || account || '未知').replace(/[\\/:*?"<>|]/g, '_');
-      images.forEach((dataUrl, imgIdx) => {
-        try {
-          const base64 = dataUrl.replace(/^data:image\/(png|jpeg|jpg);base64,/, '');
-          proofFolder.file(`${safeName}_凭证${imgIdx + 1}.png`, base64, { base64: true });
-        } catch(e) {
-          console.warn(`[Export] 保存凭证图片失败:`, e.message);
-        }
-      });
+    const rowData = [
+      seq, '', '', '', empAccount, empCnName,
+      '万利达',
+      destDisplay || '',
+      onlineStr || '', taxiStr || '', grandTotal,
+      '是', '等候过长时间线上无平台无司机接单，故当下先使用线下打车(提供等待截图)',
+      allDates.join('、'),
+      hasProof ? '' : ''  // 图片列：有图片则留空（后面嵌入图片），无图片也留空
+    ];
+    const row = ws.addRow(rowData);
+
+    // 行样式
+    row.eachCell(cell => {
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      cell.border = {
+        top: { style: 'thin' }, left: { style: 'thin' },
+        bottom: { style: 'thin' }, right: { style: 'thin' }
+      };
     });
 
-    // 把 xlsx 也加入 zip
-    const xlsxBlob = XLSX.write(wb, { bookType: 'xlsx', type: 'arraybuffer' });
-    zip.file('交通费用明细汇总表.xlsx', xlsxBlob);
-
-    // 生成 zip 并下载
-    const zipContent = await zip.generateAsync({ type: 'blob' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(zipContent);
-    a.download = '交通费用明细汇总表_含凭证.zip';
-    a.click();
-    URL.revokeObjectURL(a.href);
-  } else {
-    // 无凭证图片，直接导出 xlsx
-    XLSX.writeFile(wb, '交通费用明细汇总表.xlsx');
+    // 如果有凭证图片，嵌入到该行第15列
+    if (hasProof) {
+      const { images } = empProofMap.get(empName);
+      let imgColOffset = 0;
+      for (const img of images) {
+        try {
+          const imgId = wb.addImage({
+            buffer: img.buffer,
+            extension: 'png',
+          });
+          // 图片位置：第 seq+1 行（表头占第1行），第 IMG_COL 列
+          const colIdx = IMG_COL + imgColOffset;
+          ws.addImage(imgId, {
+            tl: { col: colIdx - 1, row: seq }, // 0-based
+            ext: { width: IMG_WIDTH, height: IMG_HEIGHT }
+          });
+          imgColOffset++;
+        } catch(e) {
+          console.warn(`[Export] 嵌入图片失败:`, e.message);
+        }
+      }
+      // 设置行高以容纳图片
+      row.height = IMG_HEIGHT * 0.75; // Excel 行高单位 ≈ px * 0.75
+    }
   }
+
+  // ── 列宽 ──
+  ws.columns = [
+    { key:'seq',     width: 6 },
+    { key:'dept',    width: 12 },
+    { key:'project', width: 12 },
+    { key:'empId',   width: 10 },
+    { key:'account', width: 15 },
+    { key:'name',    width: 10 },
+    { key:'origin',  width: 10 },
+    { key:'dest',    width: 20 },
+    { key:'online',  width: 20 },
+    { key:'taxi',    width: 20 },
+    { key:'total',   width: 10 },
+    { key:'client',  width: 10 },
+    { key:'remark',  width: 40 },
+    { key:'dates',   width: 20 },
+    { key:'proof',   width: 25 }  // 加宽以容纳图片
+  ];
+
+  // ── 导出 ──
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '交通费用明细汇总表.xlsx';
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 function loadScript(src) {
   return new Promise((res,rej) => {
