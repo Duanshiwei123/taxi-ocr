@@ -38,6 +38,34 @@ async function callBaiduApi(token, apiPath, body) {
   return await resp.json();
 }
 
+// 带 QPS 重试的 API 调用
+async function callBaiduApiWithRetry(token, apiPath, body, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const result = await callBaiduApi(token, apiPath, body);
+      // 检查返回结果中的 QPS/限流错误
+      if (result && result.error_code === 18 || 
+          (result && result.error_msg && /qps|limit|频率|限流/i.test(result.error_msg))) {
+        console.warn(`[OCR] QPS limit hit (attempt ${attempt + 1}/${maxRetries}), waiting...`);
+        if (attempt < maxRetries - 1) {
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(`Baidu OCR error: ${result.error_msg}`);
+      }
+      return result;
+    } catch (e) {
+      const isQpsError = /qps.*limit|limit.*reached|频率|限流|error_code.*18/i.test(e.message);
+      if (isQpsError && attempt < maxRetries - 1) {
+        console.warn(`[OCR] QPS error (attempt ${attempt + 1}/${maxRetries}): ${e.message}, retrying in ${1000 * (attempt + 1)}ms`);
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 function getWordValue(field) {
   if (!field) return '';
   if (Array.isArray(field) && field.length > 0) {
@@ -147,6 +175,39 @@ function normalizeDateStr(val) {
   return s;
 }
 
+// Clean up origin/destination: strip trailing date+time that Baidu OCR sometimes appends
+function cleanAddressField(val) {
+  if (!val || typeof val !== 'string') return val || '';
+  let s = val.trim();
+  const original = s;
+  s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}\s*\d{1,2}:\d{2}$/, '');
+  s = s.replace(/\s+\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}\s*$/, '');
+  s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}$/, '');
+  s = s.replace(/\/\d{1,2}\/\d{1,2}\s*\d{1,2}:\d{2}$/, '');
+  s = s.replace(/([\u4e00-\u9fa5])\s*\d{1,2}:\d{2}$/, '$1');
+  s = s.trim();
+  if (s !== original) {
+    console.log('[OCR] cleanAddressField: "' + original + '" → "' + s + '"');
+  }
+  return s;
+}
+
+// 判断一个值是否看起来像地址（用于从其他字段中寻找被错放的终点）
+function looksLikeAddress(val) {
+  if (!val || typeof val !== 'string') return false;
+  const s = val.trim();
+  if (s.length < 2) return false;
+  // 纯数字/纯日期 → 不是地址
+  if (/^[\d.]+$/.test(s)) return false;
+  if (/^\d{4}[-./]\d{1,2}[-./]\d{1,2}/.test(s)) return false;
+  // 包含建筑名关键词 → 是地址
+  const addrKeywords = /(\u5927\u53A6|\u5E7F\u573A|\u56ED\u533A|mall|\u697C|\u4E2D\u5FC3|\u673A\u573A|\u7AD9|\u5C0F\u533A|\u82B1\u56ED|\u516C\u5BD3|\u5199\u5B57\u697C|\u8DEF|\u8857|\u53E3|\u95E8|\u79D1\u6280|\u5546\u52A1|\u6751|\u82D1|\u9601)/;
+  if (addrKeywords.test(s)) return true;
+  // 纯中文且长度>=3 → 可能是地址
+  if (/^[\u4e00-\u9fa5]{3,}$/.test(s)) return true;
+  return false;
+}
+
 function parseMultipleInvoiceResult(data) {
   const results = [];
 
@@ -190,56 +251,85 @@ function parseMultipleInvoiceResult(data) {
         extractedAmount = getWordValue(firstItem.fare) || getWordValue(result.total_fare);
         parsed.origin = getWordValue(firstItem.start_place) || '';
         parsed.destination = getWordValue(firstItem.destination_place) || '';
+        
+        // DEBUG: 输出百度OCR返回的原始字段值
+        console.log('[OCR] taxi_online_ticket raw fields:');
+        console.log('  start_place:', JSON.stringify(getWordValue(firstItem.start_place)));
+        console.log('  destination_place:', JSON.stringify(getWordValue(firstItem.destination_place)));
+        console.log('  distance:', JSON.stringify(getWordValue(firstItem.distance)));
+        console.log('  pickup_date:', JSON.stringify(extractedDate));
+        console.log('  pickup_time:', JSON.stringify(extractedTime));
+        console.log('  fare:', JSON.stringify(extractedAmount));
       }
       parsed.invoice_no = '';
 
-      // ── Post-fix: detect & correct taxi_online_ticket address field confusion ──
-      // Baidu OCR sometimes splits long addresses across fields:
-      //   start_place=city(truncated), destination_place=rest of origin, distance=real destination
+      // ── Step 1: 基本清理（去除百度拼接的日期时间）──
+      if (parsed.origin) {
+        parsed.origin = cleanAddressField(parsed.origin);
+      }
+      if (parsed.destination) {
+        parsed.destination = cleanAddressField(parsed.destination);
+      }
+      console.log('[OCR] 清理后: origin=' + JSON.stringify(parsed.origin) + ' dest=' + JSON.stringify(parsed.destination));
+
+      // ── Step 2: 万利达场景修正 ──
+      // 规则: 只要百度OCR返回的 origin 或 destination 中含"万利达"，它就是起点
+      //       终点需要从其他字段(distance等)补充
       const fi = (items.length > 0) ? items[0] : null;
-      if (fi && parsed.origin && parsed.destination) {
-        const originIsJustCity = /^[\u4e00-\u9fa5]{2,4}$/.test(parsed.origin) || /\u5E02$/.test(parsed.origin);
-        const destHasBuildingName = /(\u5927\u53A6|\u5E7F\u573A|\u56ED\u533A| Mall |mall|\u697C|\u4E2D\u5FC3|\u673A\u573A|\u7AD9|\u5C0F\u533A|\u82B1\u56ED|\u516C\u5BD3|\u5199\u5B57\u697C|\u79D1\u6280|\u5546\u52A1|\u5927\u53A6)/.test(parsed.destination);
+      const hasWanlidaInOrigin = parsed.origin && /万利达/.test(parsed.origin);
+      const hasWanlidaInDest   = parsed.destination && /万利达/.test(parsed.destination);
 
-        // Check distance field for real destination (address-like, not pure numeric)
+      if (fi && (hasWanlidaInOrigin || hasWanlidaInDest)) {
+        console.log('[OCR] 万利达场景: origin=' + parsed.origin + ' dest=' + parsed.destination);
+
+        // 确定起点（含万利达的那个）
+        const realOrigin = hasWanlidaInDest ? parsed.destination : parsed.origin;
+        // 另一个字段（可能是错误放进去的，也可能就是终点）
+        const otherField  = hasWanlidaInDest ? parsed.origin : parsed.destination;
+
+        parsed.origin = realOrigin;
+        parsed.destination = '';
+
+        // ── Step 3: 找终点 ──
+        // 优先级: distance字段 > 另一个百度字段 > raw text兜底
+        let foundDest = '';
+
+        // 候选1: distance 字段（已知场景：终点被百度放到了这里）
         const distanceVal = getWordValue(fi.distance) || getWordValue(result.distance) || '';
-        const distanceLooksLikeDest = distanceVal &&
-          /(\u5927\u53A6|\u5E7F\u573A|\u56ED\u533A| Mall |mall|\u697C|\u4E2D\u5FC3|\u673A\u573A|\u7AD9|\u5C0F\u533A|\u82B1\u56ED|\u516C\u5BD3|\u5199\u5B97\u697C|\u8DEF|\u8857|\u53E3|\u95E8|\u79D1\u6280|\u5546\u52A1|\u5927\u53A6|\u6751|\u82D1|\u9601|\u8F69|\u5C45)/.test(distanceVal) &&
-          !/^[\d.]+$/.test(distanceVal) && distanceVal.length >= 2;
+        if (distanceVal && looksLikeAddress(distanceVal) && !/万利达/.test(distanceVal)) {
+          foundDest = distanceVal;
+          console.log('[OCR] 万利达-终点来自distance:', foundDest);
+        }
 
-        if (originIsJustCity && destHasBuildingName) {
-          console.log('[OCR] Suspicious address truncation detected: origin=' + parsed.origin + ' dest=' + parsed.destination);
+        // 候选2: 另一个百度字段（如果像地址且不是万利达）
+        if (!foundDest && otherField && looksLikeAddress(otherField) && !/万利达/.test(otherField)) {
+          foundDest = otherField;
+          console.log('[OCR] 万利达-终点来自另一字段:', foundDest);
+        }
 
-          if (distanceLooksLikeDest) {
-            console.log('[OCR] Found valid address in distance("' + distanceVal + '"), correcting');
-            const mergedOrigin = parsed.origin + parsed.destination;
-            parsed.origin = cleanAddressField(mergedOrigin);
-            parsed.destination = cleanAddressField(distanceVal);
-          } else {
-            // Try finding extra address line after destination line in raw text
-            const allTextLines = rawText.split('\n');
-            let destLineIdx = -1;
-            for (let i = 0; i < allTextLines.length; i++) {
-              if (/\u7EC8\u70B9/.test(allTextLines[i])) { destLineIdx = i; break; }
-            }
-            if (destLineIdx >= 0 && destLineIdx + 1 < allTextLines.length) {
-              const afterDest = allTextLines[destLineIdx + 1].trim();
-              const afterDestIsAddr = /^(?![\d])[\u4e00-\u9fa5]{2,}/.test(afterDest) &&
-                /(\u5927\u53A6|\u5E7F\u573A|\u56ED\u533A| Mall |mall|\u697C|\u4E2D\u5FC3|\u673A\u573A|\u7AD9|\u5C0F\u533A|\u82B1\u56ED|\u516C\u5BD3|\u5199\u5B57\u697C|\u8DEF|\u8857|\u53E3|\u95E8|\u79D1\u6280|\u5546\u52A1|\u6751|\u82D1|\u9601|\u8F69|\u5C45)/.test(afterDest) &&
-                !/(\u6709\u9650\u516C\u53F8|\u91D1\u989D|\u65F6\u95F4|\u65E5\u671F|\u8F66\u578B|\u670D\u52A1\u5546|\u5E8F\u53F7|\u53D1\u7968)/.test(afterDest);
-              if (afterDestIsAddr) {
-                console.log('[OCR] Found address line after dest("' + afterDest + '"), correcting');
-                const mergedOrigin = parsed.origin + parsed.destination;
-                parsed.origin = cleanAddressField(mergedOrigin);
-                parsed.destination = cleanAddressField(afterDest);
-              } else {
-                console.log('[OCR] Address truncation detected but cannot auto-fix');
+        // 候选3: 从 raw text 中搜索"终点"行后面的地址
+        if (!foundDest) {
+          const allTextLines = (rawText || '').split('\n');
+          for (let i = 0; i < allTextLines.length; i++) {
+            if (/终点/.test(allTextLines[i])) {
+              // 找"终点"所在行后面的非空行
+              for (let j = i + 1; j < allTextLines.length; j++) {
+                const line = allTextLines[j].trim();
+                if (!line) continue;
+                if (looksLikeAddress(line) && !/万利达/.test(line)) {
+                  foundDest = line;
+                  console.log('[OCR] 万利达-终点来自raw text:', foundDest);
+                  break;
+                }
+                break; // 遇到非地址行就停止
               }
-            } else {
-              console.log('[OCR] Address truncation detected but cannot auto-fix');
+              break;
             }
           }
         }
+
+        parsed.destination = foundDest;
+        console.log('[OCR] 万利达修正完成 → origin=' + parsed.origin + ' dest=' + parsed.destination);
       }
 
     } else if (type === 'vat_invoice') {
@@ -565,7 +655,7 @@ async function callBaiduFinancialOcr(imageBase64, token) {
   body.append('image', imageBase64);
   body.append('location', 'false');
 
-  const result = await callBaiduApi(token, '/rest/2.0/ocr/v1/multiple_invoice', body.toString());
+  const result = await callBaiduApiWithRetry(token, '/rest/2.0/ocr/v1/multiple_invoice', body.toString());
 
   if (result && result.error_code) {
     console.error('[OCR] multiple_invoice error:', result.error_code, result.error_msg);
@@ -578,7 +668,7 @@ async function callBaiduGeneralOcr(imageBase64, token) {
   const body = new URLSearchParams();
   body.append('image', imageBase64);
 
-  const result = await callBaiduApi(token, '/rest/2.0/ocr/v1/accurate_basic', body.toString());
+  const result = await callBaiduApiWithRetry(token, '/rest/2.0/ocr/v1/accurate_basic', body.toString());
 
   if (result && result.error_code) {
     console.error('[OCR] general OCR error:', result.error_code, result.error_msg);
@@ -687,6 +777,12 @@ export async function onRequestPost(context) {
     }
 
     const mainResult = parsedResults[0] || {};
+    // 保留百度OCR原始字段用于前端调试（仅 financial OCR 有结构化字段）
+    if (typeof financialResult !== 'undefined' && financialResult && financialResult.words_result && financialResult.words_result[0]) {
+      const firstItem = financialResult.words_result[0];
+      mainResult._rawBaiduType = firstItem.type || '';
+      mainResult._rawBaiduResult = JSON.stringify(firstItem.result || {}).substring(0, 2000);
+    }
     return new Response(JSON.stringify({
       content: JSON.stringify(mainResult),
       type: actualType,

@@ -1,13 +1,13 @@
-﻿<!-- CACHE-BUST: 20260618-1625-fix-frontend-override -->
+﻿<!-- CACHE-BUST: 20260626-1747-fix-return-in-for-loop -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <!-- v20260617-1920 fix: new file to bypass CDN cache -->
+  <!-- v20260626-1747 fix: return→push in for-loop (was exiting function after 1st invoice) -->
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
-  <title>打车发票 &amp; 加班记录核验系统 v20260618-1610</title>
+  <title>打车发票 &amp; 加班记录核验系统 v20260626-1747</title>
 
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -250,6 +250,19 @@
     #restorePrompt.show { display: flex; }
     #restorePrompt .prompt-text { color: #333; }
     #restorePrompt .prompt-actions { display: flex; gap: 8px; }
+
+    /* ===== 表格内嵌加班凭证图片 ===== */
+    .proof-cell {
+      padding: 4px !important; vertical-align: middle !important;
+      min-width: 140px; max-width: 200px;
+    }
+    .proof-thumb {
+      display: block; max-width: 180px; max-height: 120px;
+      object-fit: contain; border: 1px solid #ddd; border-radius: 4px;
+      margin-bottom: 4px; background: #fff; cursor: pointer;
+      transition: transform .15s;
+    }
+    .proof-thumb:hover { transform: scale(2.5); z-index: 10; position: relative; box-shadow: 0 4px 16px rgba(0,0,0,.25); }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script>
@@ -257,6 +270,8 @@
       pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     }
   </script>
+  <!-- SheetJS for xlsx export -->
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
 </head>
 <body>
   <!-- v20260618-1053-debug-force -->
@@ -336,11 +351,11 @@
       <span style="font-size:11px;font-weight:400;color:#999;margin-left:8px;">（数据持续累加，导出或刷新页面前不会清空）</span>
     </div>
     <div style="font-size:11px;color:#999;margin-bottom:10px;">
-      提示：部门 / 工号 / 姓名 / 是否客户结算 列可直接点击编辑 &nbsp;|&nbsp; 🗑 可删除单行
+      提示：部门 / 工号 / 是否客户结算 列可直接编辑 &nbsp;|&nbsp; 🗑 可删除 &nbsp;|&nbsp; 起点默认万利达，终点取发票识别结果（多个终点用/分隔）
     </div>
     <div class="export-row" style="margin-bottom:12px;">
       <button class="btn btn-success btn-sm" onclick="exportImg('summaryWrap','交通费用明细汇总表')">💾 导出图片</button>
-      <button class="btn btn-outline btn-sm" onclick="exportCSV()">📥 导出 CSV</button>
+      <button class="btn btn-outline btn-sm" onclick="exportXLSX()">📥 导出 XLSX</button>
       <button class="btn btn-danger btn-sm" onclick="resetAll()">⚠ 重置全部</button>
     </div>
     <div class="table-title" id="summaryTitle">xxxx年x月互联网大客户部外项目组员工交通费用汇总表</div>
@@ -353,14 +368,15 @@
             <th rowspan="2" class="yel">部门（一级）</th>
             <th rowspan="2" class="yel">客户/项目组</th>
             <th rowspan="2" class="yel">工号</th>
+            <th rowspan="2" class="yel">账号</th>
             <th rowspan="2" class="yel">姓名</th>
             <th rowspan="2">起点</th>
             <th rowspan="2">终点</th>
-            <th rowspan="2">乘车日期</th>
-            <th rowspan="2">乘车时间</th>
             <th colspan="3">交通补贴</th>
             <th rowspan="2" class="yel">是否客户结算</th>
             <th rowspan="2">备注</th>
+            <th rowspan="2">乘车日期</th>
+            <th rowspan="2">加班凭证</th>
           </tr>
           <tr>
             <th>网约车</th>
@@ -373,6 +389,7 @@
         </tbody>
       </table>
     </div>
+
   </div>
 
   <!-- ========== 区域三：加班凭证 ========== -->
@@ -672,6 +689,38 @@ async function callOCR(file, prompt) {
   return await resp.json();
 }
 
+// 带 QPS 重试的 OCR 调用（前端兜底重试）
+async function callOCRWithRetry(file, prompt, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const result = await callOCR(file, prompt);
+      // 检查后端返回的 QPS 错误
+      if (result && result.error && /qps.*limit|limit.*reached|频率/i.test(result.error)) {
+        console.warn(`[Frontend] QPS error from backend (attempt ${attempt + 1}/${maxRetries}), retrying...`);
+        if (attempt < maxRetries - 1) {
+          await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(result.error);
+      }
+      return result;
+    } catch (e) {
+      const isQpsError = /qps.*limit|limit.*reached|频率|限流/i.test(e.message || '');
+      if (isQpsError && attempt < maxRetries - 1) {
+        console.warn(`[Frontend] QPS error (attempt ${attempt + 1}/${maxRetries}): ${e.message}, retrying in ${1500 * (attempt + 1)}ms...`);
+        await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      if (attempt < maxRetries - 1) {
+        console.warn(`[Frontend] OCR error (attempt ${attempt + 1}/${maxRetries}): ${e.message}, retrying...`);
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 function parseJSON(text) {
   if (!text) return {};
   try { return JSON.parse(text.trim()); } catch(e) {}
@@ -760,13 +809,28 @@ function extractEmployeeNameFromText(text) {
 // ── 从发票OCR原始文本中提取关键字段 ──
 
 // 清洗地址字段：去除末尾粘着的日期+时间（百度OCR常见问题）
+// 常见脏数据: "深圳市2026-04-2322:39" / "深圳市 2026-04-23 22:39" / "深圳2026/04/23"
 function cleanAddr(val) {
   if (!val) return '';
   let s = String(val).trim();
+  const original = s;
+
+  // Pattern 1: "地址2026-04-2322:39" (date+time stuck to end, NO space separator)
   s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}\s*\d{1,2}:\d{2}$/, '');
+  // Pattern 2: "地址 2026-04-23 22:39" (date+time with space)
   s = s.replace(/\s+\d{4}[-./]\d{1,2}[-./]\d{1,2}\s+\d{1,2}:\d{2}\s*$/, '');
+  // Pattern 3: just trailing date "地址2026-04-23"
   s = s.replace(/\d{4}[-./]\d{1,2}[-./]\d{1,2}$/, '');
-  return s.trim();
+  // Pattern 4: "地址2026/04/23 22:39" (slash date format + time)
+  s = s.replace(/\/\d{1,2}\/\d{1,2}\s*\d{1,2}:\d{2}$/, '');
+  // Pattern 5: "地址22:39" (only time stuck after Chinese char)
+  s = s.replace(/([\u4e00-\u9fa5])\s*\d{1,2}:\d{2}$/, '$1');
+
+  s = s.trim();
+  if (s !== original) {
+    console.log('[cleanAddr] "' + original + '" → "' + s + '"');
+  }
+  return s;
 }
 
 function extractInvoiceFields(rawText) {
@@ -907,6 +971,10 @@ function extractInvoiceFields(rawText) {
     if (dm) result.dest = dm[1].trim().replace(/[：:，,。]$/, '');
   }
 
+  // 【关键】立即清洗 origin/dest：去除百度OCR粘联的日期时间
+  result.origin = cleanAddr(result.origin);
+  result.dest = cleanAddr(result.dest);
+
   console.log('[前端-发票解析] 起点:', JSON.stringify(result.origin), '| 终点:', JSON.stringify(result.dest));
   console.log('%c[前端-发票解析] ===== 提取完毕 =====', 'color:#1565c0;font-weight:bold');
   return result;
@@ -928,28 +996,66 @@ async function startAnalysis() {
   initProgress(steps);
 
   try {
-    // ── 1. 过滤重复发票 ──────────────────────────────────────
-    const newFiles = invFiles.filter(f => !invResults.find(r => r.fileName === f.name));
-    if (newFiles.length === 0 && invFiles.length > 0) {
-      setProgress(100, '⚠️ 所选发票均已分析过，如需重新分析请先重置全部。');
+    // ── 1. 智能合并模式：同文件名发票覆盖，新发票累加 ─────
+    // 移除"所选发票均已分析过"的限制，允许重新分析
+    const filesToProcess = [];
+    const filesToUpdate = [];
+
+    invFiles.forEach(f => {
+      const existingIdx = invResults.findIndex(r => r.fileName === f.name);
+      if (existingIdx >= 0) {
+        // 同名发票 → 标记为需要覆盖（先删后加）
+        filesToUpdate.push({ file: f, existingIdx });
+        console.log(`[Main] 覆盖已有发票: ${f.name} (索引 ${existingIdx})`);
+      } else {
+        // 全新发票
+        filesToProcess.push(f);
+      }
+    });
+
+    // 先移除被覆盖的旧记录（从后往前删避免索引偏移）
+    const updateIndices = filesToUpdate.map(u => u.existingIdx).sort((a, b) => b - a);
+    updateIndices.forEach(idx => {
+      console.log(`[Main] 移除旧记录: ${invResults[idx].fileName}`);
+      invResults.splice(idx, 1);
+    });
+
+    // 需要处理的文件 = 新发票 + 被覆盖的发票（重新识别）
+    const newFiles = [...filesToProcess, ...filesToUpdate.map(u => u.file)];
+    
+    if (newFiles.length === 0) {
+      setProgress(100, '⚠️ 没有需要分析的发票。');
       document.getElementById('analyzeBtn').disabled = false;
       return;
     }
-    if (newFiles.length < invFiles.length) {
-      const skip = invFiles.length - newFiles.length;
-      console.log(`[Main] Skipping ${skip} duplicate invoice(s)`);
+
+    if (filesToUpdate.length > 0) {
+      console.log(`[Main] 覆盖 ${filesToUpdate.length} 张已有发票 + 新增 ${filesToProcess.length} 张`);
+    } else {
+      console.log(`[Main] 全部新增 ${newFiles.length} 张发票`);
     }
+
     lastAnalysisCount = invResults.length;
 
-    // ── 2. 并行识别所有发票 ────────────────────────────────
+    // ── 2. 串行识别所有发票（避免百度 QPS 限流） ──────
     setStep('inv','active');
-    const invPromises = newFiles.map(async (f, i) => {
+    const newResults = [];
+    const OCR_DELAY = 800; // 每张发票间隔 800ms，防止触发限流
+
+    for (let i = 0; i < newFiles.length; i++) {
+      const f = newFiles[i];
       setProgress(
-        Math.round(5 + 45 * i / newFiles.length),
+        Math.round(5 + 45 * (i + 1) / newFiles.length),
         `识别第 ${i+1}/${newFiles.length} 张发票：${f.name}`
       );
+
+      // 非首张发票，等待间隔
+      if (i > 0) {
+        await new Promise(r => setTimeout(r, OCR_DELAY));
+      }
+
       try {
-        const raw = await callOCR(f, 'invoice');
+        const raw = await callOCRWithRetry(f, 'invoice');
         // 输出后端返回的原始数据
         console.log('%c[主流程-发票' + (i+1) + '] ===== 后端返回 =====', 'color:#0277bd;font-weight:bold');
         console.log('[主流程-发票' + (i+1) + '] raw.content:', (raw.content || '').substring(0, 1000));
@@ -957,14 +1063,43 @@ async function startAnalysis() {
         
         const parsed = parseJSON(raw.content || '');
         console.log('[主流程-发票' + (i+1) + '] parseJSON结果:', JSON.stringify(parsed).substring(0, 500));
+        
+        // 输出百度OCR原始字段（用于诊断起点/终点问题）
+        if (parsed._rawBaiduType || parsed._rawBaiduResult) {
+          console.log('[主流程-发票' + (i+1) + '] 百度原始类型:', parsed._rawBaiduType);
+          console.log('[主流程-发票' + (i+1) + '] 百度原始字段:', (parsed._rawBaiduResult || '').substring(0, 1000));
+        }
 
         // 用前端提取逻辑从原始文本中提取字段
         const invText = raw.raw || raw.content || '';
         const fe = extractInvoiceFields(invText);
 
-        // ── 智能合并 origin/dest：检测地址截断并自动修正 ──
-        let finalOrigin = cleanAddr(fe.origin || parsed.origin || '');
-        let finalDest   = cleanAddr(fe.dest || parsed.destination || parsed.dest || '');
+        // ── 智能合并 origin/dest：后端优先 + 前端兜底 ──
+        // 策略变更(v20260618-1730): 后端结构化解析结果(parsed)优先于前端文本提取(fe)
+        // 理由: 后端 parseMultipleInvoiceResult() 包含 taxi_online_ticket 地址截断修正等智能逻辑
+        let backendOrigin = cleanAddr(parsed.origin || '');
+        let backendDest   = cleanAddr(parsed.destination || parsed.dest || '');
+        let frontendOrigin = cleanAddr(fe.origin || '');
+        let frontendDest   = cleanAddr(fe.dest || '');
+
+        let finalOrigin, finalDest;
+
+        if (backendOrigin && backendDest) {
+          // 后端两个都有 → 直接用后端（经过智能修正）
+          finalOrigin = backendOrigin;
+          finalDest = backendDest;
+          console.log('[主流程] 使用后端地址: origin=' + finalOrigin + ' dest=' + finalDest);
+        } else if (frontendOrigin && frontendDest) {
+          // 后端不全，前端有 → 用前端
+          finalOrigin = frontendOrigin;
+          finalDest = frontendDest;
+          console.log('[主流程] 使用前端地址(后端不全): origin=' + finalOrigin + ' dest=' + finalDest);
+        } else {
+          // 混合策略：哪个有就用哪个
+          finalOrigin = backendOrigin || frontendOrigin;
+          finalDest = backendDest || frontendDest;
+          console.log('[主流程] 混合地址: origin=' + finalOrigin + ' dest=' + finalDest);
+        }
 
         const originIsJustCity = /^[\u4e00-\u9fa5]{2,4}$/.test(finalOrigin) || /市$/.test(finalOrigin);
         const destHasBuildingName = /(大厦|广场|园区| Mall |mall|楼|中心|机场|站|小区|花园|公寓|写字楼|科技|商务)/.test(finalDest);
@@ -1016,7 +1151,11 @@ async function startAnalysis() {
           }
         }
 
-        return {
+        // 【防御性】最终清洗：确保没有任何漏网的日期时间粘联
+        finalOrigin = cleanAddr(finalOrigin);
+        finalDest = cleanAddr(finalDest);
+
+        newResults.push({
           fileName: f.name,
           date:    fe.date || parsed.date || '',
           time:    fe.time || parsed.time || '',
@@ -1028,12 +1167,17 @@ async function startAnalysis() {
           employee: currentEmployeeName,
           raw:     invText,
           error:   ''
-        };
+        });
       } catch(e) {
-        return { fileName: f.name, date:'', time:'', amount:'', origin:'', dest:'', type:'网约车', invNo:'', raw:'', error: e.message };
+        console.error(`[Main] 发票 ${f.name} 识别失败:`, e.message);
+        // 加入空结果占位，保持序号对应
+        newResults.push({ fileName: f.name, date:'', time:'', amount:'', origin:'', dest:'', type:'网约车', invNo:'', raw:'', error: e.message });
       }
-    });
-    const newResults = await Promise.all(invPromises);
+    }
+
+    // 过滤掉完全失败的记录（error 非空且所有字段为空）
+    const validResults = newResults.filter(r => !r.error || r.date || r.amount || r.origin || r.dest);
+    // 把失败的记录也加入，方便用户看到哪张失败了
     invResults.push(...newResults);
     setStep('inv','done');
 
@@ -1182,44 +1326,166 @@ async function startAnalysis() {
   document.getElementById('analyzeBtn').disabled = false;
 }
 
-// ─── 渲染汇总表 ──────────────────────────────────────────────
+// ─── 渲染汇总表（按员工分组汇总，金额累加显示计算过程）───────────────
 function renderSummaryTable() {
   const body = document.getElementById('summaryBody');
   body.innerHTML = '';
   if (!invResults.length) {
-    body.innerHTML = '<tr><td colspan="15" class="empty-msg">暂无数据，请上传发票并点击「开始分析」</td></tr>'; return;
+    body.innerHTML = '<tr><td colspan="15" class="empty-msg">暂无数据，请上传发票并点击「开始分析」</td></tr>';
+    return;
   }
-  invResults.forEach((inv, i) => {
-    const remarkTxt = inv.matched
-      ? '✅ 已匹配加班记录'
-      : (inv.date ? '⚠️ 未找到对应加班记录' : (inv.error ? '❌识别失败' : ''));
+
+  // ── 按员工分组 ──
+  const empMap = new Map(); // employeeName -> [inv, inv, ...]
+  invResults.forEach((inv) => {
+    const key = inv.employee || '未知员工';
+    if (!empMap.has(key)) empMap.set(key, []);
+    empMap.get(key).push(inv);
+  });
+
+  let seq = 0;
+  empMap.forEach((invoices, empName) => {
+    seq++;
     const tr = document.createElement('tr');
-    tr.dataset.idx = i;
+    tr.dataset.idx = seq - 1;
+    tr.dataset.employee = empName;
+
+    // ── 分类统计金额 ──
+    const onlineAmts = [];   // 网约车金额列表（保留原始数字用于显示计算过程）
+    const taxiAmts = [];     // 出租车金额列表
+
+    invoices.forEach(inv => {
+      const amt = parseFloat(inv.amount) || 0;
+      const typ = inv.type || '网约车';
+      if (/网约|滴滴|曹操|高德|嘀嗒|线上|online/.test(typ) || !/出租|的士|taxi/i.test(typ)) {
+        onlineAmts.push(amt);
+      } else {
+        taxiAmts.push(amt);
+      }
+    });
+
+    // 网约车：显示计算过程，如 "40.3+30.4=70.7"
+    const onlineTotal = onlineAmts.reduce((a, b) => a + b, 0);
+    let onlineDisplay = '';
+    if (onlineAmts.length > 0) {
+      const parts = onlineAmts.map(a => parseFloat(a.toFixed(2)));
+      onlineDisplay = parts.join('+') + '=' + (Math.round(onlineTotal * 100) / 100).toFixed(1);
+      // 如果整数则去掉小数
+      if (onlineDisplay.endsWith('.0')) onlineDisplay = onlineDisplay.slice(0, -2);
+    }
+
+    // 出租车/公交/其他
+    const taxiTotal = taxiAmts.reduce((a, b) => a + b, 0);
+    let taxiDisplay = '';
+    if (taxiAmts.length > 0) {
+      const parts = taxiAmts.map(a => parseFloat(a.toFixed(2)));
+      taxiDisplay = parts.join('+') + '=' + (Math.round(taxiTotal * 100) / 100).toFixed(1);
+      if (taxiDisplay.endsWith('.0')) taxiDisplay = taxiDisplay.slice(0, -2);
+    }
+
+    // 小计金额
+    const grandTotal = onlineTotal + taxiTotal;
+    const grandStr = (Math.round(grandTotal * 100) / 100).toFixed(1);
+    const grandDisplay = grandStr.endsWith('.0') ? grandStr.slice(0, -2) : grandStr;
+
+    // 打车次数
+    const tripCount = invoices.length;
+
+    // ── 收集该员工所有乘车日期（用顿号分隔）─────────────────
+    const allDates = [];
+    invoices.forEach(inv => {
+      if (inv.date) {
+        // 统一转为 年/月/日 格式
+        let d = inv.date.replace(/\./g, '/').replace(/-/g, '/');
+        if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(d)) {
+          const parts = d.split('/');
+          d = parts[0] + '/' + String(parts[1]).padStart(2,'0') + '/' + String(parts[2]).padStart(2,'0');
+        }
+        if (!allDates.includes(d)) allDates.push(d);
+      }
+    });
+    const dateDisplay = allDates.length > 0 ? allDates.join('、') : '';
+
+    // ── 收集该员工所有终点（用/分隔）─────────────────
+    const allDests = [];
+    invoices.forEach(inv => {
+      if (inv.dest && !allDests.includes(inv.dest)) {
+        allDests.push(inv.dest);
+      }
+    });
+    const destDisplay = allDests.length > 0 ? allDests.join('/') : '';
+
+    // 把 empName 拆成账号（英文 v_xxx）和姓名（中文）
+    let empAccount = '', empCnName = '';
+    if (empName) {
+      // empName 格式可能是 "v_xxxx 中文名" 或纯英文 或纯中文
+      const parts = empName.split(' ');
+      const engPart = parts.find(p => /^v_/i.test(p));
+      const cnPart = parts.find(p => /^[\u4e00-\u9fa5]+$/.test(p));
+      if (engPart) empAccount = engPart.replace(/v-/i, 'v_').toLowerCase();
+      if (cnPart) empCnName = cnPart;
+      // 如果没空格，整个是英文或中文
+      if (!empAccount && !empCnName) {
+        if (/^v_/i.test(empName)) {
+          empAccount = empName.replace(/v-/i, 'v_').toLowerCase();
+        } else if (/^[\u4e00-\u9fa5]+$/.test(empName)) {
+          empCnName = empName;
+        } else {
+          empAccount = empName;
+        }
+      }
+    }
+
+    // 是否客户结算 + 备注（固定文字）
+    const isClientTxt = '是';
+    const remarkTxt = '等候过长时间线上无平台无司机接单，故当下先使用线下打车(提供等待截图)';
+
+    // 查找该员工对应的加班凭证图片（从 otHistory 中按 employeeName 匹配）
+    const proofImgHtml = getEmployeeProofImg(empName);
+
     tr.innerHTML = `
-      <td>${i+1}</td>
-      <td><button class="del-row-btn" title="删除此行" onclick="deleteRow(${i})">🗑</button></td>
-      <td><input type="text" placeholder="部门" data-idx="${i}" data-field="dept" /></td>
-      <td><input type="text" placeholder="项目组" data-idx="${i}" data-field="project" /></td>
-      <td><input type="text" placeholder="工号" data-idx="${i}" data-field="empId" /></td>
-      <td><input type="text" placeholder="姓名" data-idx="${i}" data-field="name" value="${inv.employee || ''}" /></td>
-      <td>${inv.origin  || '<span style="color:#bbb">未识别</span>'}</td>
-      <td>${inv.dest    || '<span style="color:#bbb">未识别</span>'}</td>
-      <td>${inv.date    || '<span style="color:#bbb">未识别</span>'}</td>
-      <td>${inv.time    || '<span style="color:#bbb">未识别</span>'}</td>
-      <td></td>
-      <td></td>
-      <td><strong>${inv.amount ? '¥'+inv.amount : ''}</strong></td>
-      <td><input type="text" placeholder="是/否" data-idx="${i}" data-field="isClient" /></td>
-      <td style="font-size:11px;">${remarkTxt}</td>
+      <td>${seq}</td>
+      <td><button class="del-row-btn" title="删除此员工所有记录" onclick="deleteEmployee('${empName.replace(/'/g, "\\'")}')">🗑</button></td>
+      <td><input type="text" placeholder="部门" data-emp="${empName}" data-field="dept" /></td>
+      <td><input type="text" placeholder="项目组" data-emp="${empName}" data-field="project" /></td>
+      <td><input type="text" placeholder="工号" data-emp="${empName}" data-field="empId" /></td>
+      <td>${escHtml(empAccount)}</td>
+      <td>${escHtml(empCnName)}</td>
+      <td>万利达</td>
+      <td>${destDisplay    || '<span style="color:#bbb">-</span>'}</td>
+      <td style="font-size:11px;min-width:120px;word-break:break-all;">${onlineDisplay || '<span style="color:#bbb">-</span>'}</td>
+      <td style="font-size:11px;min-width:80px;word-break:break-all;">${taxiDisplay || '<span style="color:#bbb">-</span>'}</td>
+      <td><strong>¥${grandDisplay}</strong></td>
+      <td><input type="text" value="${isClientTxt}" data-emp="${empName}" data-field="isClient" style="width:40px;text-align:center;" /></td>
+      <td style="font-size:10px;color:#666;max-width:180px;word-break:break-all;" title="${remarkTxt}">${remarkTxt}</td>
+      <td style="font-size:11px;">${dateDisplay || '<span style="color:#bbb">-</span>'}</td>
+      <td class="proof-cell">${proofImgHtml}</td>
     `;
     body.appendChild(tr);
+
+    // 高亮新行（本次分析新增的员工）
+    const allNew = invoices.every(inv => invResults.indexOf(inv) >= lastAnalysisCount);
+    if (allNew) tr.classList.add('new-row');
   });
 }
 
-// 删除行
-function deleteRow(idx) {
-  if (!confirm('确定删除第 ' + (idx+1) + ' 行吗？')) return;
-  invResults.splice(idx, 1);
+// ─── 获取员工对应的加班凭证图片 HTML（用于表格内嵌）─────────────
+function getEmployeeProofImg(empName) {
+  if (!otHistory || otHistory.length === 0) return '<span style="color:#bbb;font-size:10px;">-</span>';
+  // 从 otHistory 中找到该员工的所有凭证
+  const matched = otHistory.filter(s => s.employeeName === empName);
+  if (matched.length === 0) return '<span style="color:#bbb;font-size:10px;">-</span>';
+  let html = '';
+  matched.forEach((snap, i) => {
+    html += `<img class="proof-thumb" src="${snap.canvasDataUrl}" alt="${escHtml(empName)}-凭证${i+1}" title="${escHtml(empName)} 加班凭证 #${i+1}" />`;
+  });
+  return html;
+}
+
+// 删除员工（删除该员工的所有发票记录）
+function deleteEmployee(empName) {
+  if (!confirm(`确定删除员工「${empName}」的所有 ${invResults.filter(i => (i.employee || '未知员工') === empName).length} 条打车记录吗？`)) return;
+  invResults = invResults.filter(inv => (inv.employee || '未知员工') !== empName);
   renderSummaryTable();
   saveToLocalStorage();
 }
@@ -1634,14 +1900,15 @@ function getStorageKey() { return 'otcr_data'; }
 
 function saveToLocalStorage() {
   const summaryEdits = {};
-  document.querySelectorAll('#summaryBody tr[data-idx]').forEach(tr => {
-    const idx = tr.dataset.idx;
+  // 按员工名存储编辑内容（而非按行索引，因为汇总表按员工分组后行索引可能变动）
+  document.querySelectorAll('#summaryBody tr[data-employee]').forEach(tr => {
+    const empKey = tr.dataset.employee;
     const inputs = tr.querySelectorAll('input');
     const vals = {};
     inputs.forEach(inp => {
       if (inp.dataset.field) vals[inp.dataset.field] = inp.value;
     });
-    if (Object.keys(vals).length) summaryEdits[idx] = vals;
+    if (Object.keys(vals).length) summaryEdits[empKey] = vals;
   });
 
   const data = {
@@ -1690,9 +1957,9 @@ function restoreData() {
 
     // 恢复编辑内容
     if (data.summaryEdits) {
-      document.querySelectorAll('#summaryBody tr[data-idx]').forEach(tr => {
-        const idx = tr.dataset.idx;
-        const edits = data.summaryEdits[idx];
+      document.querySelectorAll('#summaryBody tr[data-employee]').forEach(tr => {
+        const empKey = tr.dataset.employee;
+        const edits = data.summaryEdits[empKey];
         if (edits) {
           tr.querySelectorAll('input').forEach(inp => {
             if (inp.dataset.field && edits[inp.dataset.field] !== undefined) {
@@ -1749,20 +2016,111 @@ function exportCanvas() {
 function dlCanvas(cvs, name) {
   const a = document.createElement('a'); a.href = cvs.toDataURL('image/png'); a.download = name; a.click();
 }
-function exportCSV() {
-  const rows = [['序号','部门','项目组','工号','姓名','起点','终点','乘车日期','乘车时间','网约车','出租车/公交/其他','小计','是否客户结算','备注']];
-  invResults.forEach((inv, i) => {
-    const isOnline = /网约|滴滴|曹操|高德|嘀嗒/.test(inv.type);
-    const isTaxi   = /出租/.test(inv.type);
-    const amtOnline = isOnline ? inv.amount : '';
-    const amtOther  = !isOnline ? inv.amount : '';
-    rows.push([i+1,'','','', inv.employee||'', inv.origin, inv.dest, inv.date, inv.time,
-      amtOnline, amtOther, inv.amount, '', inv.matched?'已匹配加班记录':'未匹配']);
+function exportXLSX() {
+  // 按员工分组汇总（与 renderSummaryTable 逻辑一致）
+  const empMap = new Map();
+  invResults.forEach(inv => {
+    const key = inv.employee || '未知员工';
+    if (!empMap.has(key)) empMap.set(key, []);
+    empMap.get(key).push(inv);
   });
-  const csv = rows.map(r => r.map(c=>`"${String(c??'').replace(/"/g,'""')}"`).join(',')).join('\n');
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob(['\uFEFF'+csv], {type:'text/csv;charset=utf-8;'}));
-  a.download = '交通费用明细汇总表.csv'; a.click();
+
+  const rows = [['序号','部门','项目组','工号','账号','姓名','起点','终点','网约车(计算过程)','出租车/公交/其他(计算过程)','小计金额','是否客户结算','备注','乘车日期','加班凭证']];
+
+  let seq = 0;
+  empMap.forEach((invoices, empName) => {
+    seq++;
+    const onlineAmts = [], taxiAmts = [], allDates = [], allDests = [];
+    invoices.forEach(inv => {
+      const amt = parseFloat(inv.amount) || 0;
+      if (/出租|的士|taxi/i.test(inv.type)) {
+        taxiAmts.push(amt);
+      } else {
+        onlineAmts.push(amt);
+      }
+      // 收集日期
+      if (inv.date) {
+        let d = inv.date.replace(/\./g,'/').replace(/-/g,'/');
+        if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(d)) {
+          const p = d.split('/');
+          d = p[0]+'/'+String(p[1]).padStart(2,'0')+'/'+String(p[2]).padStart(2,'0');
+        }
+        if (!allDates.includes(d)) allDates.push(d);
+      }
+      // 收集终点
+      if (inv.dest && !allDests.includes(inv.dest)) {
+        allDests.push(inv.dest);
+      }
+    });
+    const onlineTotal = onlineAmts.reduce((a, b) => a + b, 0);
+    const taxiTotal = taxiAmts.reduce((a, b) => a + b, 0);
+    const grandTotal = onlineTotal + taxiTotal;
+
+    let onlineStr = '';
+    if (onlineAmts.length > 0) onlineStr = onlineAmts.join('+') + '=' + onlineTotal;
+    let taxiStr = '';
+    if (taxiAmts.length > 0) taxiStr = taxiAmts.join('+') + '=' + taxiTotal;
+
+    // 把 empName 拆成账号（英文）和姓名（中文）
+    let empAccount = '', empCnName = '';
+    if (empName) {
+      const parts = empName.split(' ');
+      const engPart = parts.find(p => /^v_/i.test(p));
+      const cnPart = parts.find(p => /^[\u4e00-\u9fa5]+$/.test(p));
+      if (engPart) empAccount = engPart.replace(/v-/i, 'v_').toLowerCase();
+      if (cnPart) empCnName = cnPart;
+      if (!empAccount && !empCnName) {
+        if (/^v_/i.test(empName)) {
+          empAccount = empName.replace(/v-/i, 'v_').toLowerCase();
+        } else if (/^[\u4e00-\u9fa5]+$/.test(empName)) {
+          empCnName = empName;
+        } else {
+          empAccount = empName;
+        }
+      }
+    }
+
+    // 查找该员工是否有加班凭证
+    const hasProof = otHistory && otHistory.some(s => s.employeeName === empName);
+
+    const destDisplay = allDests.join('/');
+
+    rows.push([
+      seq, '', '', '', empAccount, empCnName,
+      '万利达',
+      destDisplay || '',
+      onlineStr || '', taxiStr || '', grandTotal,
+      '是', '等候过长时间线上无平台无司机接单，故当下先使用线下打车(提供等待截图)',
+      allDates.join('、'),
+      hasProof ? '见图片列' : ''
+    ]);
+  });
+
+  // 使用 SheetJS 生成 xlsx 文件
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  
+  // 设置列宽
+  ws['!cols'] = [
+    { wch: 6 },  // 序号
+    { wch: 12 }, // 部门
+    { wch: 12 }, // 项目组
+    { wch: 10 }, // 工号
+    { wch: 15 }, // 账号
+    { wch: 10 }, // 姓名
+    { wch: 10 }, // 起点
+    { wch: 20 }, // 终点
+    { wch: 20 }, // 网约车
+    { wch: 20 }, // 出租车
+    { wch: 10 }, // 小计金额
+    { wch: 10 }, // 是否客户结算
+    { wch: 40 }, // 备注
+    { wch: 20 }, // 乘车日期
+    { wch: 15 }  // 加班凭证
+  ];
+  
+  XLSX.utils.book_append_sheet(wb, ws, '交通费用明细汇总表');
+  XLSX.writeFile(wb, '交通费用明细汇总表.xlsx');
 }
 function loadScript(src) {
   return new Promise((res,rej) => {
