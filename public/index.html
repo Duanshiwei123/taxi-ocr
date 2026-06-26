@@ -1,13 +1,13 @@
-﻿<!-- CACHE-BUST: 20260626-1747-fix-return-in-for-loop -->
+﻿<!-- CACHE-BUST: 20260626-1805-export-zip-with-images -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <!-- v20260626-1747 fix: return→push in for-loop (was exiting function after 1st invoice) -->
+  <!-- v20260626-1805 fix: export XLSX with proof images in ZIP (SheetJS free lacks image support) -->
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
-  <title>打车发票 &amp; 加班记录核验系统 v20260626-1747</title>
+  <title>打车发票 &amp; 加班记录核验系统 v20260626-1805</title>
 
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2016,7 +2016,7 @@ function exportCanvas() {
 function dlCanvas(cvs, name) {
   const a = document.createElement('a'); a.href = cvs.toDataURL('image/png'); a.download = name; a.click();
 }
-function exportXLSX() {
+async function exportXLSX() {
   // 按员工分组汇总（与 renderSummaryTable 逻辑一致）
   const empMap = new Map();
   invResults.forEach(inv => {
@@ -2080,8 +2080,15 @@ function exportXLSX() {
       }
     }
 
-    // 查找该员工是否有加班凭证
-    const hasProof = otHistory && otHistory.some(s => s.employeeName === empName);
+    // 查找该员工是否有加班凭证（收集所有匹配的凭证图片 dataURL）
+    const proofImages = [];
+    if (otHistory && otHistory.length > 0) {
+      otHistory.forEach(snap => {
+        if (snap.employeeName === empName && snap.canvasDataUrl) {
+          proofImages.push(snap.canvasDataUrl);
+        }
+      });
+    }
 
     const destDisplay = allDests.join('/');
 
@@ -2092,14 +2099,41 @@ function exportXLSX() {
       onlineStr || '', taxiStr || '', grandTotal,
       '是', '等候过长时间线上无平台无司机接单，故当下先使用线下打车(提供等待截图)',
       allDates.join('、'),
-      hasProof ? '见图片列' : ''
+      proofImages.length > 0 ? '见图片' : ''
     ]);
+  });
+
+  // 收集每个员工的凭证图片（用于导出时保存为独立文件）
+  const empProofImages = []; // { account, cnName, images: string[] }
+  empMap.forEach((invoices, empName) => {
+    const imgs = [];
+    if (otHistory && otHistory.length > 0) {
+      otHistory.forEach(snap => {
+        if (snap.employeeName === empName && snap.canvasDataUrl) {
+          imgs.push(snap.canvasDataUrl);
+        }
+      });
+    }
+    if (imgs.length > 0) {
+      let account = '', cnName = '';
+      const parts = empName.split(' ');
+      const engPart = parts.find(p => /^v_/i.test(p));
+      const cnPart = parts.find(p => /^[\u4e00-\u9fa5]+$/.test(p));
+      if (engPart) account = engPart.replace(/v-/i, 'v_').toLowerCase();
+      if (cnPart) cnName = cnPart;
+      if (!account && !cnName) {
+        if (/^v_/i.test(empName)) account = empName.replace(/v-/i, 'v_').toLowerCase();
+        else if (/^[\u4e00-\u9fa5]+$/.test(empName)) cnName = empName;
+        else account = empName;
+      }
+      empProofImages.push({ account, cnName, images: imgs });
+    }
   });
 
   // 使用 SheetJS 生成 xlsx 文件
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet(rows);
-  
+
   // 设置列宽
   ws['!cols'] = [
     { wch: 6 },  // 序号
@@ -2116,11 +2150,49 @@ function exportXLSX() {
     { wch: 10 }, // 是否客户结算
     { wch: 40 }, // 备注
     { wch: 20 }, // 乘车日期
-    { wch: 15 }  // 加班凭证
+    { wch: 18 }  // 加班凭证
   ];
-  
+
   XLSX.utils.book_append_sheet(wb, ws, '交通费用明细汇总表');
-  XLSX.writeFile(wb, '交通费用明细汇总表.xlsx');
+
+  // 如果有凭证图片，用 JSZip 打包 xlsx + 图片文件夹
+  if (empProofImages.length > 0) {
+    // 加载 JSZip
+    if (typeof JSZip === 'undefined') {
+      await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+    }
+
+    const zip = new JSZip();
+    const proofFolder = zip.folder('加班凭证图片');
+
+    // 把凭证图片保存为 PNG 文件（按员工姓名命名）
+    empProofImages.forEach(({ account, cnName, images }) => {
+      const safeName = (cnName || account || '未知').replace(/[\\/:*?"<>|]/g, '_');
+      images.forEach((dataUrl, imgIdx) => {
+        try {
+          const base64 = dataUrl.replace(/^data:image\/(png|jpeg|jpg);base64,/, '');
+          proofFolder.file(`${safeName}_凭证${imgIdx + 1}.png`, base64, { base64: true });
+        } catch(e) {
+          console.warn(`[Export] 保存凭证图片失败:`, e.message);
+        }
+      });
+    });
+
+    // 把 xlsx 也加入 zip
+    const xlsxBlob = XLSX.write(wb, { bookType: 'xlsx', type: 'arraybuffer' });
+    zip.file('交通费用明细汇总表.xlsx', xlsxBlob);
+
+    // 生成 zip 并下载
+    const zipContent = await zip.generateAsync({ type: 'blob' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(zipContent);
+    a.download = '交通费用明细汇总表_含凭证.zip';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } else {
+    // 无凭证图片，直接导出 xlsx
+    XLSX.writeFile(wb, '交通费用明细汇总表.xlsx');
+  }
 }
 function loadScript(src) {
   return new Promise((res,rej) => {
